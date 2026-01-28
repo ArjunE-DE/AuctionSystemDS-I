@@ -67,14 +67,15 @@ def send_full_state(to_port):
         "type": "FULL_STATE",
         "leader": LEADER,
         "servers": KNOWN_SERVERS,
-        "state": STATE
+        "state": STATE,
+        'authenticated_clients': AUTHENTICATED_CLIENTS  # PERP
     }
     send_to_server(to_port, json.dumps(msg))
 
 def broadcast_state():
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
-            send_to_server(port, json.dumps({"type":"STATE_UPDATE","state":STATE}))
+            send_to_server(port, json.dumps({"type":"STATE_UPDATE","state":STATE, "authenticated_clients": AUTHENTICATED_CLIENTS}))
 
 # ------------------------------
 # HS leader election
@@ -200,7 +201,10 @@ def server_listener():
 
         if msg.get("type") == "STATE_UPDATE":
             STATE = msg.get("state", STATE)
-
+            #STATE.update(msg.get('state', {}))
+            AUTHENTICATED_CLIENTS.clear()  # PERP
+            authenticated_client_list = msg.get('authenticated_clients')
+            AUTHENTICATED_CLIENTS.update({int(k): v for k,v in authenticated_client_list.items()}) 
         elif msg.get("type") == "CLIENT":
             client_port = msg.get("client_port")
             CONNECTED_CLIENTS.add(client_port)
@@ -222,6 +226,9 @@ def server_listener():
             LEADER = msg.get("leader")
             KNOWN_SERVERS.update({int(port): sid for port, sid in msg.get("servers", {}).items()})
             STATE = msg.get("state", STATE)
+            AUTHENTICATED_CLIENTS.clear()  # PERP
+            authenticated_client_list = msg.get('authenticated_clients')
+            AUTHENTICATED_CLIENTS.update({int(k): v for k,v in authenticated_client_list.items()}) 
             now = time.time()
             for port in KNOWN_SERVERS:
                 LAST_HEARTBEAT[port] = now
@@ -245,13 +252,13 @@ def process_command(command, client_port):
         password = command.get("password")
         if USERS.get(username) == password:
             AUTHENTICATED_CLIENTS[client_port] = username
+            broadcast_state()  # Syncs new auth to replicas
             return {"status":"success","message":f"Logged in as {username}"}
         else:
             return {"status":"error","message":"Invalid credentials"}
-
     if client_port not in AUTHENTICATED_CLIENTS:
         return {"status":"error","message":"Not authenticated"}
-
+    print(f'{AUTHENTICATED_CLIENTS}') #for debugging remove
     username = AUTHENTICATED_CLIENTS[client_port]
     now = time.time()
 
@@ -309,6 +316,7 @@ def print_status():
             print(f" - {item['name']} | Current Bid: {item['current_bid']} | Last Bidder: {item['last_bidder']} | "
                   f"Starts: {start_time} | Ends: {end_time}")
         print(f"Connected Clients: {list(CONNECTED_CLIENTS)}")
+        print(f"Authenticated Clients: {list(AUTHENTICATED_CLIENTS)}")
         print("--------------------\n")
         time.sleep(STATUS_INTERVAL)
 
