@@ -5,6 +5,7 @@ import random
 import threading
 import time
 from datetime import datetime
+from queue import Queue
 
 # ------------------------------
 # Config
@@ -15,9 +16,28 @@ CLIENT_PORT = random.randint(6000, 7000)
 
 KNOWN_SERVERS = set()
 SERVER_LIST = []
+SERVER_LAST_SEEN = {}  # port -> timestamp
 RR_INDEX = 0
-AUTHENTICATED = False
-LAST_LIST = []
+
+SESSION_ID = None
+LEADER_PORT = None
+
+MESSAGE_QUEUE = Queue()
+INPUT_QUEUE = Queue()
+
+# ------------------------------
+# States
+# ------------------------------
+STATE_LOGIN_USERNAME = 1
+STATE_LOGIN_PASSWORD = 2
+STATE_NEW_USER_PROMPT = 3
+STATE_NEW_USER_USERNAME = 4
+STATE_NEW_USER_PASSWORD = 5
+STATE_NORMAL = 6
+
+state = STATE_LOGIN_USERNAME
+pending_new_user_message = None
+temp_username = None
 
 # ------------------------------
 # UDP socket
@@ -27,7 +47,7 @@ sock.bind(("0.0.0.0", CLIENT_PORT))
 print(f"[CLIENT] Running on port {CLIENT_PORT}")
 
 # ------------------------------
-# Multicast listener (dynamic server discovery)
+# Multicast listener
 # ------------------------------
 mcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
 mcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -49,99 +69,141 @@ def multicast_listener():
 
         port = int(msg["server_port"])
         KNOWN_SERVERS.add(port)
+        SERVER_LAST_SEEN[port] = time.time()
         SERVER_LIST = sorted(KNOWN_SERVERS)
 
+threading.Thread(target=multicast_listener, daemon=True).start()
+
 # ------------------------------
-# Listen for server responses
+# Prune dead servers (client-side)
+# ------------------------------
+def prune_dead_servers():
+    global SERVER_LIST, LEADER_PORT
+    TIMEOUT = 8
+    while True:
+        now = time.time()
+        removed = False
+        for port in list(SERVER_LIST):
+            last = SERVER_LAST_SEEN.get(port, 0)
+            if now - last > TIMEOUT:
+                print(f"[CLIENT] Pruning dead server {port} from list.")
+                SERVER_LIST.remove(port)
+                KNOWN_SERVERS.discard(port)
+                SERVER_LAST_SEEN.pop(port, None)
+                if LEADER_PORT == port:
+                    LEADER_PORT = None
+                removed = True
+        if removed and not SERVER_LIST:
+            print("[CLIENT] No known servers after pruning.")
+        time.sleep(2)
+
+threading.Thread(target=prune_dead_servers, daemon=True).start()
+
+# ------------------------------
+# Server response listener
 # ------------------------------
 def listen_responses():
-    global AUTHENTICATED, LAST_LIST
     while True:
         try:
             data, _ = sock.recvfrom(4096)
-        except (ConnectionResetError, OSError):
-            continue
-        except Exception:
-            continue
-
-        try:
             msg = json.loads(data.decode())
+            MESSAGE_QUEUE.put(msg)
         except:
             continue
 
-        if msg.get("type") != "RESPONSE":
-            continue
-
-        resp = msg["data"]
-
-        if isinstance(resp, list):
-            LAST_LIST = resp
-        elif isinstance(resp, dict):
-            if resp.get("status") == "success" and "Logged in" in resp.get("message", ""):
-                AUTHENTICATED = True
-                print(f"\n[CLIENT] {resp['message']}\n")
-            elif resp.get("status") == "error" and "Not authenticated" in resp.get("message", ""):
-                AUTHENTICATED = False
-                print(f"\n[CLIENT] {resp['message']}\n")
-            else:
-                print("\n[SERVER RESPONSE]")
-                print(json.dumps(resp, indent=2))
-                print()
-        else:
-            print("\n[SERVER RESPONSE]")
-            print(resp)
-            print()
-
-        if AUTHENTICATED and LAST_LIST:
-            display_auction_list()
+threading.Thread(target=listen_responses, daemon=True).start()
 
 # ------------------------------
-# Choose a server (round-robin + failover)
+# User input thread
+# ------------------------------
+def user_input_thread():
+    while True:
+        line = input()
+        INPUT_QUEUE.put(line)
+
+threading.Thread(target=user_input_thread, daemon=True).start()
+
+# ------------------------------
+# Round-robin server selection
 # ------------------------------
 def choose_server():
     global RR_INDEX
     if not SERVER_LIST:
         return None
-    for _ in range(len(SERVER_LIST)):
-        server = SERVER_LIST[RR_INDEX % len(SERVER_LIST)]
-        RR_INDEX += 1
-        return server
-    return None
+    server = SERVER_LIST[RR_INDEX % len(SERVER_LIST)]
+    RR_INDEX += 1
+    return server
 
 # ------------------------------
-# Safe send to server
+# Safe send with leader failover
 # ------------------------------
-def send_to_server_safe(msg):
-    server_port = choose_server()
-    if server_port is None:
-        print("[CLIENT] No servers available")
-        return False
-    try:
-        sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", server_port))
-        return True
-    except (ConnectionResetError, OSError):
-        # Server down, remove from list and retry next time
-        print(f"[CLIENT] Server {server_port} down, removing from list")
-        SERVER_LIST.remove(server_port)
-        if server_port in KNOWN_SERVERS:
-            KNOWN_SERVERS.remove(server_port)
-        return False
-    except Exception as e:
-        print(f"[CLIENT] Error sending to server {server_port}: {e}")
-        return False
+def send_to_server_safe(command):
+    global LEADER_PORT, SESSION_ID, SERVER_LIST
+
+    cmd = dict(command)
+    if SESSION_ID:
+        cmd["session_id"] = SESSION_ID
+
+    tried = set()
+    ports_to_try = []
+
+    if LEADER_PORT:
+        ports_to_try.append(LEADER_PORT)
+
+    fallback = choose_server()
+    if fallback is not None:
+        ports_to_try.append(fallback)
+
+    for port in ports_to_try:
+        if port is None or port in tried:
+            continue
+        tried.add(port)
+
+        msg = {"type": "CLIENT", "client_port": CLIENT_PORT, "command": cmd}
+
+        try:
+            sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", port))
+        except:
+            if port in SERVER_LIST:
+                print(f"[CLIENT] Failed to send to server {port}. Removing from list.")
+                SERVER_LIST.remove(port)
+            if port == LEADER_PORT:
+                LEADER_PORT = None
+            continue
+
+        time.sleep(0.2)
+        if not MESSAGE_QUEUE.empty():
+            return True
+
+        # No response from this port
+        if port == LEADER_PORT:
+            print(f"[CLIENT] Leader {LEADER_PORT} unresponsive. Removing from server list.")
+            if port in SERVER_LIST:
+                SERVER_LIST.remove(port)
+            LEADER_PORT = None
+        else:
+            if port in SERVER_LIST:
+                print(f"[CLIENT] Server {port} unresponsive. Removing from server list.")
+                SERVER_LIST.remove(port)
+
+    print("[CLIENT] No servers responded.")
+    return False
 
 # ------------------------------
-# Display auctions nicely
+# Display auctions
 # ------------------------------
-def display_auction_list():
-    if not LAST_LIST:
+def display_auction_list(items):
+    if not items:
         print("[AUCTIONS] No active auctions.\n")
         return
+
     print("\n[AUCTIONS]")
-    print(f"{'ID':<3} {'Name':<15} {'Owner':<10} {'Current Bid':<12} {'Last Bidder':<12} {'Start Time':<20} {'End Time':<20}")
-    for item in LAST_LIST:
-        start_time = datetime.fromtimestamp(item.get("start_time", time.time()))
-        end_time = datetime.fromtimestamp(item.get("end_time", time.time()))
+    print(f"{'ID':<3} {'Name':<15} {'Owner':<10} {'Current Bid':<12} "
+          f"{'Last Bidder':<12} {'Start Time':<20} {'End Time':<20}")
+
+    for item in items:
+        start_time = datetime.fromtimestamp(item["start_time"])
+        end_time = datetime.fromtimestamp(item["end_time"])
         print(f"{item['id']:<3} {item['name']:<15} {item['owner']:<10} "
               f"{item['current_bid']:<12} {str(item.get('last_bidder','-')):<12} "
               f"{start_time.strftime('%Y-%m-%d %H:%M:%S'):<20} "
@@ -149,10 +211,15 @@ def display_auction_list():
     print()
 
 # ------------------------------
-# Start threads
+# Prompt login username
 # ------------------------------
-threading.Thread(target=multicast_listener, daemon=True).start()
-threading.Thread(target=listen_responses, daemon=True).start()
+def prompt_login_username():
+    global state
+    while not INPUT_QUEUE.empty():
+        INPUT_QUEUE.get()
+    print("Login required:")
+    print("Username:")
+    state = STATE_LOGIN_USERNAME
 
 # ------------------------------
 # Wait for servers
@@ -162,60 +229,194 @@ while not SERVER_LIST:
     time.sleep(0.5)
 print(f"[CLIENT] Known servers: {SERVER_LIST}\n")
 
-# ------------------------------
-# Login phase
-# ------------------------------
-while not AUTHENTICATED:
-    print("Login required:")
-    username = input("Username: ").strip()
-    password = input("Password: ").strip()
-    command = {"action":"login","username":username,"password":password}
-    msg = {"type":"CLIENT","client_port":CLIENT_PORT,"command":command}
-    while not send_to_server_safe(msg):
-        time.sleep(0.5)
-    while not AUTHENTICATED:
-        time.sleep(0.5)
+prompt_login_username()
 
 # ------------------------------
-# Auction interface
+# MAIN LOOP
 # ------------------------------
-print("\nWelcome to the Auction!")
-print("Commands:")
-print("  list")
-print("  add <name> <description> <duration_seconds> <start_price>")
-print("  bid <item_id> <amount>")
-print("  quit\n")
-
 while True:
-    cmd = input("> ").strip()
-    if not cmd:
-        continue
-    if cmd == "quit":
-        break
 
-    parts = cmd.split()
-    command = None
+    # ------------------------------
+    # Process server messages
+    # ------------------------------
+    while not MESSAGE_QUEUE.empty():
+        msg = MESSAGE_QUEUE.get()
 
-    if parts[0] == "list":
-        command = {"action":"list"}
-    elif parts[0] == "add" and len(parts) >= 5:
-        command = {
-            "action":"add",
-            "name":parts[1],
-            "description":parts[2],
-            "duration":int(parts[3]),
-            "start_price":float(parts[4])
-        }
-    elif parts[0] == "bid" and len(parts) == 3:
-        command = {"action":"bid","item_id":int(parts[1]),"bid":float(parts[2])}
-    else:
-        print("Invalid command\n")
-        continue
+        if msg["type"] == "REDIRECT":
+            LEADER_PORT = msg["leader_port"]
+            continue
 
-    msg = {"type":"CLIENT","client_port":CLIENT_PORT,"command":command}
-    send_to_server_safe(msg)
+        if msg["type"] == "RESPONSE":
+            resp = msg["data"]
 
-    # Automatically refresh list after action
-    time.sleep(0.3)
-    list_msg = {"type":"CLIENT","client_port":CLIENT_PORT,"command":{"action":"list"}}
-    send_to_server_safe(list_msg)
+            # Auction list
+            if isinstance(resp, list):
+                display_auction_list(resp)
+                continue
+
+            # New user required
+            if isinstance(resp, dict) and resp.get("status") == "new_user":
+                pending_new_user_message = resp["message"]
+                state = STATE_NEW_USER_PROMPT
+                while not INPUT_QUEUE.empty():
+                    INPUT_QUEUE.get()
+                continue
+
+            # Login or registration success
+            if isinstance(resp, dict) and resp.get("status") == "success":
+                if "Logged in" in resp.get("message", "") or "created" in resp.get("message", ""):
+                    SESSION_ID = resp["session_id"]
+                    print(f"\n[CLIENT] {resp['message']} (session_id: {SESSION_ID})\n")
+                    state = STATE_NORMAL
+                    continue
+
+            # Bid too low
+            if isinstance(resp, dict) and resp.get("status") == "bid too low":
+                print(f"\n[BID REJECTED] {resp.get('message')}\n")
+                continue
+
+            # Generic error
+            if isinstance(resp, dict) and resp.get("status") == "error":
+                print("\n[SERVER RESPONSE]")
+                print(json.dumps(resp, indent=2))
+                if state in (STATE_NEW_USER_PASSWORD, STATE_LOGIN_PASSWORD):
+                    prompt_login_username()
+                continue
+
+    # ------------------------------
+    # Process user input
+    # ------------------------------
+    while not INPUT_QUEUE.empty():
+        cmd = INPUT_QUEUE.get().strip()
+
+        # --- Login flow ---
+        if state == STATE_LOGIN_USERNAME:
+            temp_username = cmd
+            print("Password:")
+            state = STATE_LOGIN_PASSWORD
+            continue
+
+        elif state == STATE_LOGIN_PASSWORD:
+            send_to_server_safe({
+                "action": "login",
+                "username": temp_username,
+                "password": cmd
+            })
+            continue
+
+        # --- New user prompt ---
+        elif state == STATE_NEW_USER_PROMPT:
+            if pending_new_user_message is not None:
+                print(pending_new_user_message)
+                print("Create new user? (yes/no):")
+                pending_new_user_message = None
+
+            if cmd.lower() == "yes":
+                while not INPUT_QUEUE.empty():
+                    INPUT_QUEUE.get()
+                print("Choose username:")
+                state = STATE_NEW_USER_USERNAME
+            elif cmd.lower() == "no":
+                prompt_login_username()
+            else:
+                print("Please type 'yes' or 'no':")
+            continue
+
+        elif state == STATE_NEW_USER_USERNAME:
+            temp_username = cmd
+            while not INPUT_QUEUE.empty():
+                INPUT_QUEUE.get()
+            print("Choose password:")
+            state = STATE_NEW_USER_PASSWORD
+            continue
+
+        elif state == STATE_NEW_USER_PASSWORD:
+            send_to_server_safe({
+                "action": "register",
+                "username": temp_username,
+                "password": cmd
+            })
+            continue
+
+        # --- Normal auction commands ---
+        elif state == STATE_NORMAL:
+            if not cmd:
+                continue
+
+            parts = cmd.split()
+            if not parts:
+                continue
+
+            action = parts[0].lower()
+            args = parts[1:]
+            command = None
+
+            # LIST
+            if action == "list":
+                if args:
+                    print("Usage: list\n")
+                    continue
+                command = {"action": "list"}
+
+            # ADD
+            elif action == "add":
+                if len(args) < 4:
+                    print("Usage: add <name> <description> <duration> <start_price>\n")
+                    continue
+
+                name = args[0]
+                description = args[1]
+
+                try:
+                    duration = int(args[2])
+                    start_price = float(args[3])
+                except ValueError:
+                    print("Duration must be an integer, start_price must be a number.\n")
+                    continue
+
+                command = {
+                    "action": "add",
+                    "name": name,
+                    "description": description,
+                    "duration": duration,
+                    "start_price": start_price
+                }
+
+            # BID
+            elif action == "bid":
+                if len(args) != 2:
+                    print("Usage: bid <item_id> <amount>\n")
+                    continue
+
+                try:
+                    item_id = int(args[0])
+                    amount = float(args[1])
+                except ValueError:
+                    print("Item ID must be an integer, amount must be a number.\n")
+                    continue
+
+                command = {
+                    "action": "bid",
+                    "item_id": item_id,
+                    "bid": amount
+                }
+
+            # QUIT
+            elif action == "quit":
+                print("Goodbye.")
+                exit(0)
+
+            # UNKNOWN
+            else:
+                print("Unknown command. Available commands:")
+                print("  list")
+                print("  add <name> <description> <duration> <start_price>")
+                print("  bid <item_id> <amount>")
+                print("  quit\n")
+                continue
+
+            send_to_server_safe(command)
+            time.sleep(0.1)
+            send_to_server_safe({"action": "list"})
+
+    time.sleep(0.05)
