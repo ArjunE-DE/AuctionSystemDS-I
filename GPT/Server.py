@@ -15,15 +15,16 @@ SERVER_ID = random.randint(1000, 9999)
 
 STATE = {"items": []}
 LEADER = None
-KNOWN_SERVERS = {}       # port -> server_id
-LAST_HEARTBEAT = {}      # port -> timestamp
+KNOWN_SERVERS = {}        # port -> server_id
+LAST_HEARTBEAT = {}       # port -> timestamp
 
 # HS election state
 HS_ACTIVE = False
 HS_PHASE = 0
 HS_EPOCH = 0
-HS_RETURNED = {}         # candidate_id -> {phase: {'LEFT': False, 'RIGHT': False}}
-HS_RING = []
+HS_RING = []              # [(port, server_id)]
+HS_RETURNED = {}          # {phase: {'LEFT': False, 'RIGHT': False}}
+HS_MAX_CANDIDATE = None   # max candidate seen in current phase
 
 # Membership stability
 STABLE_DELAY = 1  # seconds
@@ -73,7 +74,8 @@ def send_server_snapshot(to_port):
     msg = {
         "type": "SERVER_SNAPSHOT",
         "leader": LEADER,
-        "servers": KNOWN_SERVERS
+        "servers": KNOWN_SERVERS,
+        "epoch": HS_EPOCH
     }
     send_to_server(to_port, json.dumps(msg))
     print(f"[{SERVER_PORT}] 🗂 Sent snapshot to {to_port} | Leader={LEADER}")
@@ -82,13 +84,10 @@ def send_server_snapshot(to_port):
 # Ring helpers (deterministic)
 # ------------------------------
 def compute_ring():
-    # Include self and known servers
     items = list(KNOWN_SERVERS.items()) + [(SERVER_PORT, SERVER_ID)]
-    # Deduplicate by server ID
     unique_items = {}
     for port, sid in items:
         unique_items[sid] = port
-    # Return sorted list of tuples (port, id)
     return sorted([(port, sid) for sid, port in unique_items.items()], key=lambda x: x[1])
 
 def ring_neighbors(ring=None):
@@ -96,140 +95,175 @@ def ring_neighbors(ring=None):
     n = len(ring)
     if n == 1:
         return SERVER_PORT, SERVER_PORT
-    # Ports sorted by ID
     ports_sorted = [port for port, _ in ring]
     idx = ports_sorted.index(SERVER_PORT)
     left = ports_sorted[(idx - 1) % n]
     right = ports_sorted[(idx + 1) % n]
-    # Safety: avoid sending to self if n>=2
-    if right == SERVER_PORT:
-        right = left
     return left, right
 
 # ------------------------------
 # Hirschberg–Sinclair Election
 # ------------------------------
+HS_ACTIVE = False
+HS_PHASE = 0
+HS_EPOCH = 0
+HS_RING = []              # [(port, server_id)]
+HS_RETURNED = {}          # {phase: {'LEFT': False, 'RIGHT': False}}
+HS_MAX_CANDIDATE = None   # max candidate seen in current phase
+HS_LEFT_PORT = {}         # left port per phase
+HS_RIGHT_PORT = {}        # right port per phase
+
 def maybe_start_hs(force=False):
     global last_membership_change
-    if HS_ACTIVE or len(KNOWN_SERVERS) == 0:
+    if HS_ACTIVE:
         return
-    if not force and LEADER is not None:
+    if LEADER and not force:
         return
     if not force and (time.time() - last_membership_change < STABLE_DELAY):
         return
     start_hs_election()
 
 def start_hs_election():
-    global HS_ACTIVE, HS_PHASE, HS_EPOCH, HS_RING, HS_RETURNED
+    global HS_ACTIVE, HS_PHASE, HS_EPOCH, HS_RING, HS_RETURNED, HS_MAX_CANDIDATE
     if HS_ACTIVE:
         return
     HS_ACTIVE = True
     HS_PHASE = 0
     HS_EPOCH += 1
-    HS_RETURNED = {SERVER_ID: {HS_PHASE: {'LEFT': False, 'RIGHT': False}}}
     HS_RING = compute_ring()
+    HS_RETURNED = {HS_PHASE: {'LEFT': False, 'RIGHT': False}}
+    HS_MAX_CANDIDATE = SERVER_ID
+
+    left, right = ring_neighbors()
+    HS_LEFT_PORT[HS_PHASE] = left
+    HS_RIGHT_PORT[HS_PHASE] = right
+
+    print(f"[{SERVER_PORT}] 🔁 HS START/JOIN | Epoch={HS_EPOCH} | Ring={[sid for _, sid in HS_RING]}")
     if len(HS_RING) == 1:
         elect_self()
         return
-    print(f"[{SERVER_PORT}] 🔁 HS START | epoch={HS_EPOCH} | Ring={[sid for _, sid in HS_RING]}")
-    send_hs_messages()
+    send_hs_messages(SERVER_ID, HS_PHASE)
 
-def send_hs_messages():
-    global HS_PHASE
-    left, right = ring_neighbors()
-    hops = 2 ** HS_PHASE
-    base = {
+def send_hs_messages(candidate, phase):
+    left = HS_LEFT_PORT[phase]
+    right = HS_RIGHT_PORT[phase]
+    hops = 2 ** phase
+
+    base_msg = {
         "type": "ELECTION",
-        "candidate": SERVER_ID,
-        "phase": HS_PHASE,
-        "hops": hops,
+        "candidate": candidate,
+        "phase": phase,
         "epoch": HS_EPOCH,
-        "hop_count": 0
+        "hop_count": 0,
+        "max_hops": hops,
+        "origin_id": SERVER_ID,
+        "origin_direction": None,  # for replies
+        "sender_port": SERVER_PORT
     }
-    print(f"[{SERVER_PORT}] 📤 HS phase={HS_PHASE} hops={hops} LEFT={left} RIGHT={right}")
-    send_to_server(left, json.dumps({**base, "direction": "LEFT"}))
-    send_to_server(right, json.dumps({**base, "direction": "RIGHT"}))
+
+    print(f"[{SERVER_PORT}] 📤 Sent candidate {candidate} dir=LEFT to {left} hops={hops}")
+    print(f"[{SERVER_PORT}] 📤 Sent candidate {candidate} dir=RIGHT to {right} hops={hops}")
+
+    send_to_server(left, json.dumps({**base_msg, "direction": "LEFT", "origin_direction": "LEFT"}))
+    send_to_server(right, json.dumps({**base_msg, "direction": "RIGHT", "origin_direction": "RIGHT"}))
 
 def handle_election(msg):
-    global HS_PHASE
-    cand = msg["candidate"]
+    global HS_MAX_CANDIDATE
+    candidate = msg["candidate"]
+    phase = msg["phase"]
     epoch = msg["epoch"]
     direction = msg["direction"]
-    hops = msg["hops"]
-    hop_count = msg.get("hop_count", 0)
+    hop_count = msg["hop_count"]
+    max_hops = msg["max_hops"]
+    origin_id = msg["origin_id"]
+    origin_direction = msg["origin_direction"]
+    sender_port = msg["sender_port"]
 
     if epoch != HS_EPOCH:
         return
 
-    print(f"[{SERVER_PORT}] 📥 ELECTION received cand={cand} hop_count={hop_count}/{hops} dir={direction}")
+    # Only consider candidates >= self
+    if candidate < SERVER_ID:
+        candidate = SERVER_ID
 
-    # Own ID received → mark return
-    if cand == SERVER_ID:
-        HS_RETURNED.setdefault(SERVER_ID, {}).setdefault(HS_PHASE, {'LEFT': False, 'RIGHT': False})
-        HS_RETURNED[SERVER_ID][HS_PHASE][direction] = True
-        print(f"[{SERVER_PORT}] 🔄 Own ID returned from {direction}")
-        check_phase_completion()
-        return
+    if candidate > HS_MAX_CANDIDATE:
+        HS_MAX_CANDIDATE = candidate
 
-    # Candidate < self ID → replace with own ID
-    if cand < SERVER_ID:
-        msg["candidate"] = SERVER_ID
-        msg["hop_count"] = hop_count + 1
-        forward(msg)
-        return
+    hop_count += 1
+    msg["candidate"] = candidate
+    msg["hop_count"] = hop_count
+    msg["sender_port"] = SERVER_PORT
+    msg["origin_direction"] = origin_direction
 
-    # Candidate > self ID → forward as is
-    if cand > SERVER_ID:
-        if hop_count < hops:
-            msg["hop_count"] = hop_count + 1
-            forward(msg)
-        else:
-            # Hop limit reached → send reply
-            send_reply(msg)
+    if hop_count < max_hops:
+        # Forward in same direction
+        next_hop = ring_neighbors()[0] if direction == "LEFT" else ring_neighbors()[1]
+        send_to_server(next_hop, json.dumps(msg))
+        print(f"[{SERVER_PORT}] ➡️ Forwarding {candidate} dir={direction} hop_count={hop_count}")
+    else:
+        # Max hops reached → send REPLY along reverse path
+        send_reply(msg, sender_port)
 
-def send_reply(msg):
+def send_reply(msg, return_port):
     reply = {
         "type": "REPLY",
         "candidate": msg["candidate"],
-        "direction": "LEFT" if msg["direction"] == "RIGHT" else "RIGHT",
-        "epoch": msg["epoch"]
+        "phase": msg["phase"],
+        "epoch": msg["epoch"],
+        "origin_id": msg["origin_id"],
+        "return_port": return_port,
+        "origin_direction": msg["origin_direction"]
     }
-    forward(reply)
+    send_to_server(return_port, json.dumps(reply))
+    print(f"[{SERVER_PORT}] 📩 REPLY sent for candidate {msg['candidate']} back to {return_port} (dir={msg['origin_direction']})")
 
 def handle_reply(msg):
-    cand = msg["candidate"]
+    global HS_PHASE, HS_ACTIVE, HS_MAX_CANDIDATE
+    candidate = msg["candidate"]
+    phase = msg["phase"]
     epoch = msg["epoch"]
-    direction = msg["direction"]
+    origin_id = msg["origin_id"]
+    return_port = msg["return_port"]
+    origin_direction = msg.get("origin_direction")
 
     if epoch != HS_EPOCH:
         return
-    if cand != SERVER_ID:
-        forward(msg)
-        return
-    HS_RETURNED.setdefault(SERVER_ID, {}).setdefault(HS_PHASE, {'LEFT': False, 'RIGHT': False})
-    HS_RETURNED[SERVER_ID][HS_PHASE][direction] = True
-    print(f"[{SERVER_PORT}] 📬 REPLY from {direction}")
-    check_phase_completion()
 
-def forward(msg):
-    left, right = ring_neighbors()
-    target = left if msg["direction"] == "LEFT" else right
-    send_to_server(target, json.dumps(msg))
-    print(f"[{SERVER_PORT}] ➡️ Forwarding {msg['candidate']} dir={msg['direction']} hop_count={msg.get('hop_count',0)}")
+    # Forward if not origin
+    if origin_id != SERVER_ID:
+        send_to_server(return_port, json.dumps(msg))
+        print(f"[{SERVER_PORT}] ➡️ Forwarding REPLY for {candidate} back to {return_port}")
+        return
+
+    # Origin node → mark LEFT/RIGHT based on origin_direction
+    if origin_direction == "LEFT":
+        HS_RETURNED[phase]['LEFT'] = True
+    elif origin_direction == "RIGHT":
+        HS_RETURNED[phase]['RIGHT'] = True
+    else:
+        print(f"[{SERVER_PORT}] 📬 REPLY received from UNKNOWN for candidate {candidate}")
+
+    if candidate > HS_MAX_CANDIDATE:
+        HS_MAX_CANDIDATE = candidate
+
+    print(f"[{SERVER_PORT}] 📬 REPLY received for candidate {candidate} dir={origin_direction}")
+    check_phase_completion()
 
 def check_phase_completion():
     global HS_PHASE, HS_ACTIVE
-    returned = HS_RETURNED.get(SERVER_ID, {}).get(HS_PHASE, {})
+    returned = HS_RETURNED.get(HS_PHASE, {})
     if returned.get('LEFT') and returned.get('RIGHT'):
-        # Phase complete
-        max_id = max([sid for _, sid in HS_RING])
-        if SERVER_ID == max_id:
+        if HS_MAX_CANDIDATE == SERVER_ID:
             elect_self()
         else:
             HS_PHASE += 1
-            HS_RETURNED[SERVER_ID][HS_PHASE] = {'LEFT': False, 'RIGHT': False}
+            HS_RETURNED[HS_PHASE] = {'LEFT': False, 'RIGHT': False}
+            left, right = ring_neighbors()
+            HS_LEFT_PORT[HS_PHASE] = left
+            HS_RIGHT_PORT[HS_PHASE] = right
             print(f"[{SERVER_PORT}] 🔁 HS phase {HS_PHASE} start")
-            send_hs_messages()
+            send_hs_messages(HS_MAX_CANDIDATE, HS_PHASE)
+
 
 def elect_self():
     global LEADER, HS_ACTIVE
@@ -246,7 +280,7 @@ def broadcast_leader():
             send_server_snapshot(port)
 
 # ------------------------------
-# Multicast discovery
+# Multicast listener
 # ------------------------------
 def multicast_listener():
     global last_membership_change
@@ -276,12 +310,12 @@ def multicast_listener():
 # Leader monitor
 # ------------------------------
 def leader_monitor():
-    global LEADER, HS_ACTIVE
+    global LEADER
     while True:
         if LEADER and LEADER != SERVER_ID:
             leader_port = next((p for p, sid in KNOWN_SERVERS.items() if sid == LEADER), None)
             if not leader_port or time.time() - LAST_HEARTBEAT.get(leader_port,0) > HEARTBEAT_TIMEOUT:
-                print(f"[{SERVER_PORT}] 💀 Leader {LEADER} dead → removing and restart HS")
+                print(f"[{SERVER_PORT}] 💀 Leader {LEADER} dead → triggering HS")
                 if leader_port:
                     KNOWN_SERVERS.pop(leader_port, None)
                     LAST_HEARTBEAT.pop(leader_port, None)
@@ -338,19 +372,14 @@ def periodic_hello():
 def print_status():
     while True:
         print(f"\n[{SERVER_PORT}] STATUS")
-        print(f"ID={SERVER_ID} | Leader={LEADER}")
-        print(f"Known={list(KNOWN_SERVERS.values())}")
+        print(f"ID={SERVER_ID} | Leader={LEADER} | Epoch={HS_EPOCH}")
+        print(f"Known IDs={list(KNOWN_SERVERS.values())}")
         time.sleep(STATUS_INTERVAL)
 
 # ------------------------------
 # Main
 # ------------------------------
 if __name__ == "__main__":
-    # Ensure unique SERVER_ID
-    existing_ids = set(KNOWN_SERVERS.values())
-    while SERVER_ID in existing_ids:
-        SERVER_ID = random.randint(1000, 9999)
-
     KNOWN_SERVERS[SERVER_PORT] = SERVER_ID
     LAST_HEARTBEAT[SERVER_PORT] = time.time()
 
