@@ -5,39 +5,47 @@ import json
 import random
 import time
 from datetime import datetime
+from math import ceil, log2
 
 # ------------------------------
 # Configuration
 # ------------------------------
 MCAST_GRP = "224.1.1.1"
 MCAST_PORT = 5000
-SERVER_PORT = random.randint(5001, 5010)
 SERVER_ID = random.randint(1000, 9999)
 
 STATE = {"items": []}
 LEADER = None
-KNOWN_SERVERS = {}      # port -> server_id
-LAST_HEARTBEAT = {}     # port -> timestamp
+KNOWN_SERVERS = {}  # port -> server_id
+LAST_HEARTBEAT = {}  # port -> timestamp
 CONNECTED_CLIENTS = set()
-SESSIONS = {}           # session_id -> username
+AUTHENTICATED_CLIENTS = {}  # client_port -> username
 
+# Hard-coded credentials
 USERS = {
     "alice": "password1",
     "bob": "password2",
     "charlie": "1234"
 }
 
+# Timing
 STATUS_INTERVAL = 10
 DISCOVERY_INTERVAL = 1
 HEARTBEAT_INTERVAL = 2
 HEARTBEAT_TIMEOUT = 6
 FULL_STATE_INTERVAL = 5
 
+# Max HS initiations per node
+MAX_HS_INIT = 3
+HS_INIT_COUNT = 0
+
 # ------------------------------
 # UDP sockets
 # ------------------------------
 server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-server_sock.bind(("0.0.0.0", SERVER_PORT))
+server_sock.bind(("0.0.0.0", 0))  # 0 means OS will pick a free port
+SERVER_PORT = server_sock.getsockname()[1]  # read the actual port assigned
+
 
 mcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
 mcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -60,78 +68,89 @@ def send_hello():
     msg = {"type": "HELLO", "server_port": SERVER_PORT, "server_id": SERVER_ID}
     send_to_multicast(json.dumps(msg))
 
-def send_full_state(to_port):
+def send_full_state(to_port=None):
     msg = {
         "type": "FULL_STATE",
         "leader": LEADER,
         "servers": KNOWN_SERVERS,
-        "state": STATE,
-        "sessions": SESSIONS,
-        "users": USERS
+        "state": STATE
     }
-    send_to_server(to_port, json.dumps(msg))
+    if to_port is None:
+        for port in KNOWN_SERVERS:
+            if port != SERVER_PORT:
+                send_to_server(port, json.dumps(msg))
+    else:
+        send_to_server(to_port, json.dumps(msg))
 
 def broadcast_state():
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
-            send_to_server(port, json.dumps({
-                "type": "STATE_UPDATE",
-                "state": STATE,
-                "sessions": SESSIONS,
-                "users": USERS
-            }))
-
-def normalize_sessions(sessions_dict):
-    normalized = {}
-    for k, v in sessions_dict.items():
-        try:
-            sid = int(k)
-        except:
-            sid = k
-        normalized[sid] = v
-    return normalized
+            send_to_server(port, json.dumps({"type":"STATE_UPDATE","state":STATE}))
 
 # ------------------------------
-# Session replication helpers
+# Hirschberg-Sinclair state
 # ------------------------------
-def send_session_update():
-    if LEADER != SERVER_ID:
-        return
-    msg = {"type": "SESSION_UPDATE", "sessions": SESSIONS}
-    for port in KNOWN_SERVERS:
-        if port != SERVER_PORT:
-            send_to_server(port, json.dumps(msg))
+HS_STATE = {
+    "current_phase": 0,
+    "replies_received": {"LEFT": False, "RIGHT": False},
+    "phase_in_progress": False,
+    "max_phase": 0,
+    "candidate_id": None
+}
 
-def request_sessions_from_others():
-    if LEADER != SERVER_ID:
-        return
-    msg = {"type": "SESSION_REQUEST"}
-    for port in KNOWN_SERVERS:
-        if port != SERVER_PORT:
-            send_to_server(port, json.dumps(msg))
+def get_ring_neighbors():
+    ports = sorted(KNOWN_SERVERS.keys())
+    idx = ports.index(SERVER_PORT)
+    left = ports[idx - 1] if idx > 0 else ports[-1]
+    right = ports[(idx + 1) % len(ports)]
+    return left, right
 
-def merge_sessions(remote_sessions):
-    global SESSIONS
-    remote_sessions = normalize_sessions(remote_sessions)
-    for sid, username in remote_sessions.items():
-        if sid not in SESSIONS:
-            SESSIONS[sid] = username
+def send_hs_election(candidate_id, phase, direction, hop, max_hop):
+    left, right = get_ring_neighbors()
+    target = left if direction == "LEFT" else right
+    print(f"[{SERVER_PORT}] Sending HS_ELECTION: candidate={candidate_id}, phase={phase}, "
+          f"direction={direction}, hop={hop}/{max_hop} -> port {target}")
+    msg = {
+        "type": "HS_ELECTION",
+        "candidate_id": candidate_id,
+        "phase": phase,
+        "direction": direction,
+        "hop": hop,
+        "max_hop": max_hop,
+        "origin": SERVER_PORT
+    }
+    send_to_server(target, json.dumps(msg))
 
-# ------------------------------
-# Leader Election
-# ------------------------------
+def send_hs_reply(candidate_id, direction, origin):
+    left, right = get_ring_neighbors()
+    target = left if direction == "LEFT" else right
+    print(f"[{SERVER_PORT}] Sending HS_REPLY: candidate={candidate_id}, direction={direction} -> port {target}")
+    msg = {
+        "type": "HS_REPLY",
+        "candidate_id": candidate_id,
+        "direction": direction,
+        "origin": origin
+    }
+    send_to_server(target, json.dumps(msg))
+
 def hs_election():
-    global LEADER
-    all_ids = list(KNOWN_SERVERS.values()) + [SERVER_ID]
-    new_leader = max(all_ids)
-    if LEADER != new_leader:
-        LEADER = new_leader
-        print(f"[{SERVER_PORT}] Leader elected: {LEADER}")
-        if LEADER == SERVER_ID:
-            request_sessions_from_others()
+    global HS_INIT_COUNT
+    if HS_INIT_COUNT >= MAX_HS_INIT or len(KNOWN_SERVERS) == 0:
+        return
+    HS_INIT_COUNT += 1
+    HS_STATE["candidate_id"] = SERVER_ID
+    HS_STATE["current_phase"] = 0
+    HS_STATE["replies_received"] = {"LEFT": False, "RIGHT": False}
+    HS_STATE["phase_in_progress"] = True
+    HS_STATE["max_phase"] = ceil(log2(len(KNOWN_SERVERS)))
+    ring_sorted = sorted(KNOWN_SERVERS.values())
+    print(f"[{SERVER_PORT}] Starting HS election as candidate {SERVER_ID}")
+    print(f"[{SERVER_PORT}] Ring for election: {ring_sorted}")
+    send_hs_election(SERVER_ID, 0, "LEFT", 1, 1)
+    send_hs_election(SERVER_ID, 0, "RIGHT", 1, 1)
 
 # ------------------------------
-# Multicast Listener
+# Multicast listener
 # ------------------------------
 def multicast_listener():
     global KNOWN_SERVERS, LAST_HEARTBEAT
@@ -141,6 +160,7 @@ def multicast_listener():
             msg = json.loads(data.decode())
         except:
             continue
+
         if msg.get("type") != "HELLO":
             continue
 
@@ -153,8 +173,10 @@ def multicast_listener():
         KNOWN_SERVERS[port] = sid
         LAST_HEARTBEAT[port] = time.time()
 
-        if is_new and LEADER == SERVER_ID:
-            send_full_state(port)
+        if is_new:
+            print(f"[{SERVER_PORT}] Discovered server {sid} on port {port}")
+            if LEADER == SERVER_ID:
+                send_full_state(port)
 
 # ------------------------------
 # Periodic HELLO
@@ -165,16 +187,18 @@ def periodic_hello():
         time.sleep(DISCOVERY_INTERVAL)
 
 # ------------------------------
-# Full State Broadcast
+# Full state broadcast (leader)
 # ------------------------------
 def full_state_broadcast():
     while True:
         if LEADER == SERVER_ID:
-            broadcast_state()
+            for port in KNOWN_SERVERS:
+                if port != SERVER_PORT:
+                    send_full_state(port)
         time.sleep(FULL_STATE_INTERVAL)
 
 # ------------------------------
-# Leader Monitor
+# Leader monitor
 # ------------------------------
 def leader_monitor():
     global LEADER
@@ -186,31 +210,41 @@ def leader_monitor():
                     leader_port = port
                     break
             now = time.time()
-            if leader_port is None or now - LAST_HEARTBEAT.get(leader_port, 0) > HEARTBEAT_TIMEOUT:
+            if leader_port is None or (leader_port in LAST_HEARTBEAT and now - LAST_HEARTBEAT[leader_port] > HEARTBEAT_TIMEOUT):
                 if leader_port:
+                    # Remove dead leader first
+                    print(f"[{SERVER_PORT}] Removing dead leader {LEADER}")
                     KNOWN_SERVERS.pop(leader_port, None)
                     LAST_HEARTBEAT.pop(leader_port, None)
+                # Broadcast updated server list before HS
+                send_full_state()
                 hs_election()
         time.sleep(HEARTBEAT_INTERVAL)
 
+# ------------------------------
+# Leader monitor all servers
+# ------------------------------
 def leader_check_servers():
     while True:
         if LEADER == SERVER_ID:
             now = time.time()
-            dead = []
+            dead_ports = []
             for port in list(KNOWN_SERVERS.keys()):
                 if port == SERVER_PORT:
                     continue
-                if now - LAST_HEARTBEAT.get(port, 0) > HEARTBEAT_TIMEOUT:
-                    dead.append(port)
-            for port in dead:
+                if port not in LAST_HEARTBEAT or now - LAST_HEARTBEAT[port] > HEARTBEAT_TIMEOUT:
+                    dead_ports.append(port)
+            for port in dead_ports:
                 print(f"[{SERVER_PORT}] Removing dead server {port}")
-                KNOWN_SERVERS.pop(port, None)
+                KNOWN_SERVERS.pop(port)
                 LAST_HEARTBEAT.pop(port, None)
+            # After removing dead servers, broadcast full state
+            if dead_ports:
+                send_full_state()
         time.sleep(HEARTBEAT_INTERVAL)
 
 # ------------------------------
-# Auction Timer
+# Auction timer
 # ------------------------------
 def auction_timer():
     while True:
@@ -218,83 +252,142 @@ def auction_timer():
             now = time.time()
             for item in STATE["items"]:
                 if item["end_time"] and now > item["end_time"]:
-                    item["end_time"] = now
+                    item["end_time"] = now  # close auction
         time.sleep(1)
 
 # ------------------------------
-# Process Command (Leader Only)
+# Server listener
 # ------------------------------
-def process_command(command):
-    global STATE, SESSIONS, USERS
+def server_listener():
+    global STATE, KNOWN_SERVERS, LEADER, LAST_HEARTBEAT
+    while True:
+        data, addr = server_sock.recvfrom(4096)
+        try:
+            msg = json.loads(data.decode())
+        except:
+            continue
 
-    # ------------------------------
-    # REGISTER
-    # ------------------------------
-    if command["action"] == "register":
-        username = command.get("username")
-        password = command.get("password")
+        # ---------------- HS messages ----------------
+        if msg.get("type") == "HS_ELECTION":
+            candidate = msg["candidate_id"]
+            phase = msg["phase"]
+            direction = msg["direction"]
+            hop = msg["hop"]
+            max_hop = msg["max_hop"]
+            origin = msg["origin"]
+            print(f"[{SERVER_PORT}] Received HS_ELECTION: candidate={candidate}, phase={phase}, "
+                  f"direction={direction}, hop={hop}/{max_hop} from {addr[1]} origin={origin}")
 
-        if username in USERS:
-            return {"status": "error", "message": "User already exists"}
+            if candidate == SERVER_ID:
+                # Ignore own candidate message
+                pass
+            elif candidate > SERVER_ID:
+                if hop < max_hop:
+                    # Forward to next node
+                    send_hs_election(candidate, phase, direction, hop + 1, max_hop)
+                else:
+                    # Reply back
+                    reply_dir = "LEFT" if direction == "RIGHT" else "RIGHT"
+                    send_hs_reply(candidate, reply_dir, origin)
+            else:
+                print(f"[{SERVER_PORT}] Ignoring HS_ELECTION from lower candidate {candidate}")
 
-        USERS[username] = password
+        elif msg.get("type") == "HS_REPLY":
+            candidate = msg["candidate_id"]
+            direction = msg["direction"]
+            origin = msg["origin"]
+            print(f"[{SERVER_PORT}] Received HS_REPLY: candidate={candidate}, direction={direction} from {addr[1]}")
+            if candidate != SERVER_ID:
+                send_hs_reply(candidate, direction, origin)
+            else:
+                HS_STATE["replies_received"][direction] = True
+                if all(HS_STATE["replies_received"].values()):
+                    if HS_STATE["current_phase"] >= HS_STATE["max_phase"]:
+                        LEADER = SERVER_ID
+                        HS_STATE["phase_in_progress"] = False
+                        print(f"[{SERVER_PORT}] Leader elected via HS: {LEADER}")
+                    else:
+                        # Increment phase
+                        HS_STATE["current_phase"] += 1
+                        phase = HS_STATE["current_phase"]
+                        HS_STATE["replies_received"] = {"LEFT": False, "RIGHT": False}
+                        print(f"[{SERVER_PORT}] Incrementing HS phase to {phase}, restarting election")
+                        max_hop = 2 ** phase
+                        send_hs_election(SERVER_ID, phase, "LEFT", 1, max_hop)
+                        send_hs_election(SERVER_ID, phase, "RIGHT", 1, max_hop)
 
-        session_id = random.randint(10000, 99999)
-        SESSIONS[session_id] = username
+        # ---------------- Client and state messages ----------------
+        elif msg.get("type") == "STATE_UPDATE":
+            STATE = msg.get("state", STATE)
 
-        broadcast_state()
-        send_session_update()
+        elif msg.get("type") == "CLIENT":
+            client_port = msg.get("client_port")
+            CONNECTED_CLIENTS.add(client_port)
+            command = msg.get("command")
+            if SERVER_ID == LEADER:
+                response = process_command(command, client_port)
+                send_to_server(client_port, json.dumps({"type":"RESPONSE","data":response}))
+                broadcast_state()
+            else:
+                leader_port = None
+                for port, sid in KNOWN_SERVERS.items():
+                    if sid == LEADER:
+                        leader_port = port
+                        break
+                if leader_port:
+                    send_to_server(leader_port, json.dumps(msg))
 
-        return {
-            "status": "success",
-            "message": f"User '{username}' created and logged in",
-            "session_id": session_id
-        }
+        elif msg.get("type") == "FULL_STATE":
+            old_leader = LEADER
+            LEADER = msg.get("leader")
+            if LEADER != old_leader:
+                print(f"[{SERVER_PORT}] Adopting leader info from node: {LEADER}")
+            # Sync KNOWN_SERVERS: remove nodes not present in leader's list
+            leader_servers = {int(port): sid for port, sid in msg.get("servers", {}).items()}
+            for port in list(KNOWN_SERVERS.keys()):
+                if port not in leader_servers:
+                    print(f"[{SERVER_PORT}] Removing unknown server {port} per leader update")
+                    KNOWN_SERVERS.pop(port, None)
+                    LAST_HEARTBEAT.pop(port, None)
+            KNOWN_SERVERS.update(leader_servers)
+            STATE = msg.get("state", STATE)
+            now = time.time()
+            for port in KNOWN_SERVERS:
+                LAST_HEARTBEAT[port] = now
+            LAST_HEARTBEAT[SERVER_PORT] = now
 
-    # ------------------------------
-    # LOGIN
-    # ------------------------------
+        elif msg.get("type") == "PING":
+            if SERVER_ID == LEADER:
+                send_to_server(addr[1], json.dumps({"type":"PONG"}))
+
+        elif msg.get("type") == "PONG":
+            for port, sid in KNOWN_SERVERS.items():
+                if port == addr[1]:
+                    LAST_HEARTBEAT[port] = time.time()
+
+# ------------------------------
+# Command processor
+# ------------------------------
+def process_command(command, client_port):
     if command["action"] == "login":
         username = command.get("username")
         password = command.get("password")
+        if USERS.get(username) == password:
+            AUTHENTICATED_CLIENTS[client_port] = username
+            return {"status":"success","message":f"Logged in as {username}"}
+        else:
+            return {"status":"error","message":"Invalid credentials"}
 
-        if username not in USERS:
-            return {
-                "status": "new_user",
-                "message": f"User '{username}' does not exist. Create new account?"
-            }
+    if client_port not in AUTHENTICATED_CLIENTS:
+        return {"status":"error","message":"Not authenticated"}
 
-        if USERS[username] != password:
-            return {"status": "error", "message": "Invalid password"}
-
-        session_id = random.randint(10000, 99999)
-        SESSIONS[session_id] = username
-
-        broadcast_state()
-        send_session_update()
-
-        return {"status": "success", "message": f"Logged in as {username}", "session_id": session_id}
-
-    # ------------------------------
-    # SESSION VALIDATION
-    # ------------------------------
-    session_id = command.get("session_id")
-    if session_id not in SESSIONS:
-        return {"status": "error", "message": "Not authenticated"}
-
-    username = SESSIONS[session_id]
+    username = AUTHENTICATED_CLIENTS[client_port]
     now = time.time()
 
-    # ------------------------------
-    # LIST
-    # ------------------------------
     if command["action"] == "list":
         return [item for item in STATE["items"] if item["end_time"] > now]
 
-    # ------------------------------
-    # ADD
-    # ------------------------------
-    if command["action"] == "add":
+    elif command["action"] == "add":
         item_id = len(STATE["items"]) + 1
         duration = command.get("duration", 60)
         start_time = now
@@ -310,121 +403,42 @@ def process_command(command):
             "last_bidder": None
         }
         STATE["items"].append(new_item)
-        broadcast_state()
         return {"status":"added","item_id":item_id}
 
-    # ------------------------------
-    # BID
-    # ------------------------------
-    if command["action"] == "bid":
+    elif command["action"] == "bid":
         for item in STATE["items"]:
             if item["id"] == command["item_id"]:
                 if item["end_time"] <= now:
                     return {"status":"error","message":"Auction closed"}
-
-                min_bid = max(item["start_price"], item["current_bid"])
-
-                if command["bid"] > min_bid:
+                if command["bid"] > item["current_bid"]:
                     item["current_bid"] = command["bid"]
                     item["last_bidder"] = username
-                    broadcast_state()
                     return {"status":"bid accepted"}
                 else:
-                    return {
-                        "status": "bid too low",
-                        "message": f"Minimum bid is {min_bid}"
-                    }
-
+                    return {"status":"bid too low"}
         return {"status":"error","message":"Item not found"}
 
     return {"status":"unknown command"}
 
 # ------------------------------
-# Server Listener
-# ------------------------------
-def server_listener():
-    global STATE, KNOWN_SERVERS, LEADER, LAST_HEARTBEAT, SESSIONS, USERS
-    while True:
-        data, addr = server_sock.recvfrom(4096)
-        try:
-            msg = json.loads(data.decode())
-        except:
-            continue
-
-        mtype = msg.get("type")
-
-        if mtype == "CLIENT":
-            client_port = msg.get("client_port")
-            command = msg.get("command")
-
-            if SERVER_ID == LEADER:
-                response = process_command(command)
-                send_to_server(client_port, json.dumps({"type":"RESPONSE","data":response}))
-            else:
-                leader_port = None
-                for port, sid in KNOWN_SERVERS.items():
-                    if sid == LEADER:
-                        leader_port = port
-                        break
-
-                if leader_port:
-                    send_to_server(client_port, json.dumps({
-                        "type": "REDIRECT",
-                        "leader_port": leader_port
-                    }))
-                else:
-                    send_to_server(client_port, json.dumps({
-                        "type": "RESPONSE",
-                        "data": {"status": "error", "message": "No leader available"}
-                    }))
-
-        elif mtype == "STATE_UPDATE":
-            STATE.update(msg.get("state", {}))
-            SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
-            USERS.update(msg.get("users", {}))
-
-        elif mtype == "FULL_STATE":
-            LEADER = msg.get("leader")
-            KNOWN_SERVERS.update({int(p): s for p,s in msg.get("servers", {}).items()})
-            STATE.update(msg.get("state", {}))
-            SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
-            USERS.update(msg.get("users", {}))
-            now = time.time()
-            for port in KNOWN_SERVERS:
-                LAST_HEARTBEAT[port] = now
-            LAST_HEARTBEAT[SERVER_PORT] = now
-
-        elif mtype == "SESSION_UPDATE":
-            SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
-            ack = {"type": "SESSION_ACK", "server_port": SERVER_PORT}
-            server_sock.sendto(json.dumps(ack).encode(), addr)
-
-        elif mtype == "SESSION_REQUEST":
-            if LEADER != SERVER_ID:
-                dump = {
-                    "type": "SESSION_DUMP",
-                    "sessions": SESSIONS,
-                    "server_port": SERVER_PORT
-                }
-                server_sock.sendto(json.dumps(dump).encode(), addr)
-
-        elif mtype == "SESSION_DUMP":
-            if LEADER == SERVER_ID:
-                merge_sessions(msg.get("sessions", {}))
-
-        elif mtype == "SESSION_ACK":
-            pass
-
-# ------------------------------
-# Status Printer
+# Status printer
 # ------------------------------
 def print_status():
     while True:
         sorted_ids = sorted(set(list(KNOWN_SERVERS.values()) + [SERVER_ID]))
-        print(f"\n--- STATUS ---\nID: {SERVER_ID} | Leader: {LEADER} | Known: {sorted_ids}")
-        print(f"Auction items: {len(STATE['items'])}")
-        print(f"Sessions: {SESSIONS}")
-        print(f"Users: {USERS}\n----------------------")
+        print(f"\n--- STATUS UPDATE ---")
+        print(f"My ID: {SERVER_ID}")
+        print(f"Known Server IDs: {sorted_ids}")
+        print(f"Current Leader: {LEADER}")
+        print(f"Auction Items: {len(STATE['items'])}")
+        now = time.time()
+        for item in STATE["items"]:
+            start_time = datetime.fromtimestamp(item.get("start_time", now)).strftime('%Y-%m-%d %H:%M:%S')
+            end_time = datetime.fromtimestamp(item.get("end_time", now)).strftime('%Y-%m-%d %H:%M:%S')
+            print(f" - {item['name']} | Current Bid: {item['current_bid']} | Last Bidder: {item['last_bidder']} | "
+                  f"Starts: {start_time} | Ends: {end_time}")
+        print(f"Connected Clients: {list(CONNECTED_CLIENTS)}")
+        print("--------------------\n")
         time.sleep(STATUS_INTERVAL)
 
 # ------------------------------
@@ -443,12 +457,12 @@ if __name__ == "__main__":
     threading.Thread(target=full_state_broadcast, daemon=True).start()
     threading.Thread(target=auction_timer, daemon=True).start()
 
+    # Startup discovery window
     time.sleep(5)
     if LEADER is None:
         if len(KNOWN_SERVERS) == 1:
             LEADER = SERVER_ID
-            print(f"[{SERVER_PORT}] Electing self as leader.")
-            request_sessions_from_others()
+            print(f"[{SERVER_PORT}] No other servers found. Electing self as leader.")
         else:
             time.sleep(2)
             if LEADER is None:
