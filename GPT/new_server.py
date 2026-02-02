@@ -21,6 +21,9 @@ LAST_HEARTBEAT = {}     # port -> timestamp
 CONNECTED_CLIENTS = set()
 SESSIONS = {}           # session_id -> username
 
+# NEW: map port -> ip (servers and clients)
+PEER_IPS = {}           # port -> ip string
+
 USERS = {
     "alice": "password1",
     "bob": "password2",
@@ -85,7 +88,12 @@ multicast.register_handler("HELLO", handle_hello)
 # Utilities
 # ------------------------------
 def send_to_server(port, msg):
-    server_sock.sendto(msg.encode(), ("127.0.0.1", port))
+    """
+    Send to a peer (server or client) by port, using the last known IP.
+    Falls back to 127.0.0.1 if we don't know the IP (e.g. same-machine).
+    """
+    ip = PEER_IPS.get(port, "127.0.0.1")
+    server_sock.sendto(msg.encode(), (ip, port))
 
 def send_hello():
     msg = {"type": "HELLO", "server_port": SERVER_PORT, "server_id": SERVER_ID}
@@ -165,6 +173,35 @@ def hs_election():
             request_sessions_from_others()
 
 # ------------------------------
+# Multicast Listener
+# ------------------------------
+def multicast_listener():
+    global KNOWN_SERVERS, LAST_HEARTBEAT, PEER_IPS
+    while True:
+        try:
+            data, addr = mcast_sock.recvfrom(1024)
+            msg = json.loads(data.decode())
+        except:
+            continue
+        if msg.get("type") != "HELLO":
+            continue
+
+        port = int(msg["server_port"])
+        sid = msg["server_id"]
+        ip = addr[0]
+
+        if port == SERVER_PORT:
+            continue
+
+        is_new = port not in KNOWN_SERVERS
+        KNOWN_SERVERS[port] = sid
+        LAST_HEARTBEAT[port] = time.time()
+        PEER_IPS[port] = ip
+
+        if is_new and LEADER == SERVER_ID:
+            send_full_state(port)
+
+# ------------------------------
 # Periodic HELLO
 # ------------------------------
 def periodic_hello():
@@ -215,6 +252,7 @@ def leader_check_servers():
                 print(f"[{SERVER_PORT}] Removing dead server {port}")
                 KNOWN_SERVERS.pop(port, None)
                 LAST_HEARTBEAT.pop(port, None)
+                PEER_IPS.pop(port, None)
         time.sleep(HEARTBEAT_INTERVAL)
 
 # ------------------------------
@@ -235,9 +273,7 @@ def auction_timer():
 def process_command(command):
     global STATE, SESSIONS, USERS
 
-    # ------------------------------
     # REGISTER
-    # ------------------------------
     if command["action"] == "register":
         username = command.get("username")
         password = command.get("password")
@@ -259,9 +295,7 @@ def process_command(command):
             "session_id": session_id
         }
 
-    # ------------------------------
     # LOGIN
-    # ------------------------------
     if command["action"] == "login":
         username = command.get("username")
         password = command.get("password")
@@ -283,9 +317,7 @@ def process_command(command):
 
         return {"status": "success", "message": f"Logged in as {username}", "session_id": session_id}
 
-    # ------------------------------
     # SESSION VALIDATION
-    # ------------------------------
     session_id = command.get("session_id")
     if session_id not in SESSIONS:
         return {"status": "error", "message": "Not authenticated"}
@@ -293,15 +325,11 @@ def process_command(command):
     username = SESSIONS[session_id]
     now = time.time()
 
-    # ------------------------------
     # LIST
-    # ------------------------------
     if command["action"] == "list":
         return [item for item in STATE["items"] if item["end_time"] > now]
 
-    # ------------------------------
     # ADD
-    # ------------------------------
     if command["action"] == "add":
         item_id = len(STATE["items"]) + 1
         duration = command.get("duration", 60)
@@ -321,9 +349,7 @@ def process_command(command):
         broadcast_state({"action": "add", "user": username})
         return {"status":"added","item_id":item_id}
 
-    # ------------------------------
     # BID
-    # ------------------------------
     if command["action"] == "bid":
         for item in STATE["items"]:
             if item["id"] == command["item_id"]:
@@ -351,7 +377,7 @@ def process_command(command):
 # Server Listener
 # ------------------------------
 def server_listener():
-    global STATE, KNOWN_SERVERS, LEADER, LAST_HEARTBEAT, SESSIONS, USERS
+    global STATE, KNOWN_SERVERS, LEADER, LAST_HEARTBEAT, SESSIONS, USERS, PEER_IPS
     while True:
         data, addr = server_sock.recvfrom(4096)
         try:
@@ -363,6 +389,10 @@ def server_listener():
 
         if mtype == "CLIENT":
             client_port = msg.get("client_port")
+            # remember client IP
+            if client_port is not None:
+                PEER_IPS[client_port] = addr[0]
+
             command = msg.get("command")
 
             if SERVER_ID == LEADER:
@@ -441,6 +471,8 @@ def print_status():
 if __name__ == "__main__":
     KNOWN_SERVERS[SERVER_PORT] = SERVER_ID
     LAST_HEARTBEAT[SERVER_PORT] = time.time()
+    # local server IP for self (not strictly needed, but consistent)
+    PEER_IPS[SERVER_PORT] = "127.0.0.1"
 
     # Start ordered multicast listener for reliable causal ordering
     multicast.start_listener()

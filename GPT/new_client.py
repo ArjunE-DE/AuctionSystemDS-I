@@ -19,6 +19,9 @@ SERVER_LIST = []
 SERVER_LAST_SEEN = {}  # port -> timestamp
 RR_INDEX = 0
 
+# NEW: map server port -> server IP
+SERVER_IPS = {}        # port -> ip string
+
 SESSION_ID = None
 LEADER_PORT = None
 
@@ -59,7 +62,7 @@ def multicast_listener():
     global SERVER_LIST
     while True:
         try:
-            data, _ = mcast_sock.recvfrom(1024)
+            data, addr = mcast_sock.recvfrom(1024)
             msg = json.loads(data.decode())
         except:
             continue
@@ -68,8 +71,11 @@ def multicast_listener():
             continue
 
         port = int(msg["server_port"])
+        ip = addr[0]
+
         KNOWN_SERVERS.add(port)
         SERVER_LAST_SEEN[port] = time.time()
+        SERVER_IPS[port] = ip
         SERVER_LIST = sorted(KNOWN_SERVERS)
 
 threading.Thread(target=multicast_listener, daemon=True).start()
@@ -90,6 +96,7 @@ def prune_dead_servers():
                 SERVER_LIST.remove(port)
                 KNOWN_SERVERS.discard(port)
                 SERVER_LAST_SEEN.pop(port, None)
+                SERVER_IPS.pop(port, None)
                 if LEADER_PORT == port:
                     LEADER_PORT = None
                 removed = True
@@ -161,8 +168,10 @@ def send_to_server_safe(command):
 
         msg = {"type": "CLIENT", "client_port": CLIENT_PORT, "command": cmd}
 
+        ip = SERVER_IPS.get(port, "127.0.0.1")
+
         try:
-            sock.sendto(json.dumps(msg).encode(), ("127.0.0.1", port))
+            sock.sendto(json.dumps(msg).encode(), (ip, port))
         except:
             if port in SERVER_LIST:
                 print(f"[CLIENT] Failed to send to server {port}. Removing from list.")
