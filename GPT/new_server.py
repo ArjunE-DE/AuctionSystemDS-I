@@ -5,7 +5,7 @@ import json
 import random
 import time
 from datetime import datetime
-
+from multicast import OrderedMulticast
 # ------------------------------
 # Configuration
 # ------------------------------
@@ -45,20 +45,51 @@ mcast_sock.bind(("", MCAST_PORT))
 mreq = struct.pack("4sl", socket.inet_aton(MCAST_GRP), socket.INADDR_ANY)
 mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
+# ------------------------------
+# Ordered Multicast Setup
+# ------------------------------
+multicast = OrderedMulticast(SERVER_ID, KNOWN_SERVERS)
 print(f"[{SERVER_PORT}] Server started with ID {SERVER_ID}")
+
+def handle_state_update(payload):
+    global STATE, SESSIONS, USERS
+    STATE.update(payload.get("state", {}))
+    SESSIONS.update(normalize_sessions(payload.get("sessions", {})))
+    USERS.update(payload.get("users", {}))
+    current_action = payload.get("action", "")
+    if current_action is not None and current_action != '': 
+        print(f"[{SERVER_PORT}] {current_action['action']} performed by {current_action['user']} with timestamp {payload.get('ts')}")
+    else:
+        print(f"[{SERVER_PORT}] Received ordered STATE_UPDATE with timestamp {payload.get('ts')}")
+
+def handle_hello(payload):
+    global KNOWN_SERVERS, LAST_HEARTBEAT
+    port = int(payload["server_port"])
+    sid = payload["server_id"]
+    
+    if port == SERVER_PORT:
+        return
+    
+    is_new = port not in KNOWN_SERVERS
+    KNOWN_SERVERS[port] = sid
+    LAST_HEARTBEAT[port] = time.time()
+    
+    if is_new and LEADER == SERVER_ID:
+        print(f"[{SERVER_PORT}] Broadcasting full state to new server {sid} at port {port}")
+        broadcast_state()
+
+multicast.register_handler("STATE_UPDATE", handle_state_update)
+multicast.register_handler("HELLO", handle_hello)
 
 # ------------------------------
 # Utilities
 # ------------------------------
-def send_to_multicast(msg):
-    mcast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
-
 def send_to_server(port, msg):
     server_sock.sendto(msg.encode(), ("127.0.0.1", port))
 
 def send_hello():
     msg = {"type": "HELLO", "server_port": SERVER_PORT, "server_id": SERVER_ID}
-    send_to_multicast(json.dumps(msg))
+    multicast.multicast(msg)
 
 def send_full_state(to_port):
     msg = {
@@ -71,15 +102,18 @@ def send_full_state(to_port):
     }
     send_to_server(to_port, json.dumps(msg))
 
-def broadcast_state():
-    for port in KNOWN_SERVERS:
-        if port != SERVER_PORT:
-            send_to_server(port, json.dumps({
-                "type": "STATE_UPDATE",
-                "state": STATE,
-                "sessions": SESSIONS,
-                "users": USERS
-            }))
+def broadcast_state(action=''):
+    payload = {
+        "type": "STATE_UPDATE",
+        "leader": LEADER,
+        "servers": KNOWN_SERVERS,
+        "state": STATE,
+        "sessions": SESSIONS,
+        "users": USERS,
+        "action": action
+    }
+    multicast.multicast(payload)
+    print(f"[{SERVER_PORT}] Broadcasting state via ordered multicast")
 
 def normalize_sessions(sessions_dict):
     normalized = {}
@@ -129,32 +163,6 @@ def hs_election():
         print(f"[{SERVER_PORT}] Leader elected: {LEADER}")
         if LEADER == SERVER_ID:
             request_sessions_from_others()
-
-# ------------------------------
-# Multicast Listener
-# ------------------------------
-def multicast_listener():
-    global KNOWN_SERVERS, LAST_HEARTBEAT
-    while True:
-        try:
-            data, _ = mcast_sock.recvfrom(1024)
-            msg = json.loads(data.decode())
-        except:
-            continue
-        if msg.get("type") != "HELLO":
-            continue
-
-        port = int(msg["server_port"])
-        sid = msg["server_id"]
-        if port == SERVER_PORT:
-            continue
-
-        is_new = port not in KNOWN_SERVERS
-        KNOWN_SERVERS[port] = sid
-        LAST_HEARTBEAT[port] = time.time()
-
-        if is_new and LEADER == SERVER_ID:
-            send_full_state(port)
 
 # ------------------------------
 # Periodic HELLO
@@ -242,7 +250,7 @@ def process_command(command):
         session_id = random.randint(10000, 99999)
         SESSIONS[session_id] = username
 
-        broadcast_state()
+        broadcast_state({"action": "register", "user": username})
         send_session_update()
 
         return {
@@ -270,7 +278,7 @@ def process_command(command):
         session_id = random.randint(10000, 99999)
         SESSIONS[session_id] = username
 
-        broadcast_state()
+        broadcast_state({"action": "login", "user": username})
         send_session_update()
 
         return {"status": "success", "message": f"Logged in as {username}", "session_id": session_id}
@@ -310,7 +318,7 @@ def process_command(command):
             "last_bidder": None
         }
         STATE["items"].append(new_item)
-        broadcast_state()
+        broadcast_state({"action": "add", "user": username})
         return {"status":"added","item_id":item_id}
 
     # ------------------------------
@@ -327,7 +335,7 @@ def process_command(command):
                 if command["bid"] > min_bid:
                     item["current_bid"] = command["bid"]
                     item["last_bidder"] = username
-                    broadcast_state()
+                    broadcast_state({"action": "bid", "user": username})
                     return {"status":"bid accepted"}
                 else:
                     return {
@@ -434,7 +442,9 @@ if __name__ == "__main__":
     KNOWN_SERVERS[SERVER_PORT] = SERVER_ID
     LAST_HEARTBEAT[SERVER_PORT] = time.time()
 
-    threading.Thread(target=multicast_listener, daemon=True).start()
+    # Start ordered multicast listener for reliable causal ordering
+    multicast.start_listener()
+
     threading.Thread(target=server_listener, daemon=True).start()
     threading.Thread(target=print_status, daemon=True).start()
     threading.Thread(target=periodic_hello, daemon=True).start()
