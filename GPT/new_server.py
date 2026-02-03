@@ -214,6 +214,7 @@ HS_STATE = {
 
 def get_ring_neighbors():
     ports = sorted(KNOWN_SERVERS.keys())
+    #print(f'{ports}')
     idx = ports.index(SERVER_PORT)
     left = ports[idx - 1] if idx > 0 else ports[-1]
     right = ports[(idx + 1) % len(ports)]
@@ -248,6 +249,7 @@ def send_hs_reply(candidate_id, direction, origin):
     send_to_server(target, json.dumps(msg))
 
 def hs_election():
+    print('WE ARE CALLING HS ELECTION ATM')
     global HS_INIT_COUNT
     if HS_INIT_COUNT >= MAX_HS_INIT or len(KNOWN_SERVERS) == 0:
         return
@@ -257,6 +259,7 @@ def hs_election():
     HS_STATE["replies_received"] = {"LEFT": False, "RIGHT": False}
     HS_STATE["phase_in_progress"] = True
     HS_STATE["max_phase"] = ceil(log2(len(KNOWN_SERVERS)))
+
     ring_sorted = sorted(KNOWN_SERVERS.values())
     print(f"[{SERVER_PORT}] Starting HS election as candidate {SERVER_ID}")
     print(f"[{SERVER_PORT}] Ring for election: {ring_sorted}")
@@ -348,7 +351,7 @@ def leader_check_servers():
             for port in list(KNOWN_SERVERS.keys()):
                 if port == SERVER_PORT:
                     continue
-                if now - LAST_HEARTBEAT.get(port, 0) > HEARTBEAT_TIMEOUT:
+                if port not in LAST_HEARTBEAT or now - LAST_HEARTBEAT[port] > HEARTBEAT_TIMEOUT:
                     dead.append(port)
             for port in dead:
                 print(f"[{SERVER_PORT}] Removing dead server {port}")
@@ -533,6 +536,8 @@ def server_listener():
             if candidate != SERVER_ID:
                 send_hs_reply(candidate, direction, origin)
             else:
+                print(f'SHOW ME THIS LOGGED {direction}')
+                print(f'SHOW ME THIS LOGGED {HS_STATE}')
                 HS_STATE["replies_received"][direction] = True
                 if all(HS_STATE["replies_received"].values()):
                     if HS_STATE["current_phase"] >= HS_STATE["max_phase"]:
