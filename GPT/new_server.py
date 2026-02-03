@@ -164,7 +164,7 @@ def broadcast_state(action={}):
                 "action": action,
                 "ts": LAMPORT.read()
             }))
-          send_to_server(port, json.dumps({"type":"STATE_UPDATE","state":STATE}))
+            send_to_server(port, json.dumps({"type":"STATE_UPDATE","state":STATE}))
 def normalize_sessions(sessions_dict):
     normalized = {}
     for k, v in sessions_dict.items():
@@ -460,8 +460,7 @@ def server_listener():
                 LAST_HEARTBEAT[port] = now
             LAST_HEARTBEAT[SERVER_PORT] = now
 
-        broadcast_state({"New user created": username})
-        send_session_update()
+        
         elif msg.get("type") == "PING":
             if SERVER_ID == LEADER:
                 send_to_server(addr[1], json.dumps({"type":"PONG"}))
