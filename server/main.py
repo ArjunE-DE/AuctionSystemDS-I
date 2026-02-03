@@ -2,14 +2,26 @@ from fastapi import FastAPI, HTTPException, Request
 from models import AuctionItem, Bid
 from storage import storage
 from replication import replicate_to_peers
+from election import start_election, is_leader, leader_url, start_monitor
 import uuid
+import requests
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_election()
+    start_monitor()
+    yield
+
+app = FastAPI(lifespan=lifespan)
 
 # ===== CLIENT ENDPOINTS =====
 
 @app.post("/auction")
 async def create_auction(auction: AuctionItem, request: Request):
+    if not is_leader():
+        return requests.post(f"{leader_url}/auction", json=auction.dict()).json()
+
     auction.id = str(uuid.uuid4())
     storage.add_auction(auction)
 
@@ -29,6 +41,9 @@ async def list_auctions():
 
 @app.post("/bid/{auction_id}")
 async def place_bid(auction_id: str, bid: Bid, request: Request):
+    if not is_leader():
+        return requests.post(f"{leader_url}/bid/{auction_id}", json=bid.dict()).json()
+
     auction = storage.get_auction(auction_id)
 
     if not auction:
@@ -73,3 +88,17 @@ async def replicate_bid(data: dict):
         storage.update_auction(auction)
 
     return {"status": "replicated"}
+
+
+# ===== HEALTH & LEADER ENDPOINTS =====
+
+@app.get("/health")
+def health():
+    return {"status": "alive"}
+
+@app.post("/leader")
+def set_leader(data: dict):
+    global leader_url
+    leader_url = data["leader"]
+    print(f"[Leader Update] Leader set to: {leader_url}")  # <- add this
+    return {"status": "ok"}
