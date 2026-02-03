@@ -19,7 +19,6 @@ STATE = {"items": []}
 LEADER = None
 KNOWN_SERVERS = {}      # port -> server_id
 LAST_HEARTBEAT = {}     # port -> timestamp
-CONNECTED_CLIENTS = set()
 SESSIONS = {}           # session_id -> username
 ACK_TRACKER = {}      # port -> expected ACK time
 
@@ -96,9 +95,10 @@ def send_to_server(port, msg):
     Send to a peer (server or client) by port, using the last known IP.
     Falls back to 127.0.0.1 if we don't know the IP (e.g. same-machine).
     """
+    if port is None:
+        return
     ip = PEER_IPS.get(port, "127.0.0.1")
     msg = json.loads(msg)  # Ensure the message is a dictionary
-    #msg["ts"] = LAMPORT.tick()  # Increment Lamport clock and attach timestamp
     server_sock.sendto(json.dumps(msg).encode(), (ip, port))
 
 def send_ack_to_leader():
@@ -134,7 +134,7 @@ def send_hello():
     msg = {"type": "HELLO", "server_port": SERVER_PORT, "server_id": SERVER_ID}
     send_to_multicast(json.dumps(msg))
 
-def send_full_state(to_port):
+def send_full_state(to_port=None):
     msg = {
         "type": "FULL_STATE",
         "leader": LEADER,
@@ -143,17 +143,11 @@ def send_full_state(to_port):
         "sessions": SESSIONS,
         "users": USERS
     }
-    if to_port is None:
-        for port in KNOWN_SERVERS:
-            if port != SERVER_PORT:
-                send_to_server(port, json.dumps(msg))
-    else:
-        send_to_server(to_port, json.dumps(msg))
+    #print(f'This is the leader in send full state: {LEADER}')
     send_to_server(to_port, json.dumps(msg))
 
 def broadcast_state(action={}):
     if 'add' in action or 'bid' in action:
-        print(f"Entered block at [{SERVER_PORT}] Broadcasting state update: {action}")
         LAMPORT.tick()
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
@@ -214,7 +208,6 @@ HS_STATE = {
 
 def get_ring_neighbors():
     ports = sorted(KNOWN_SERVERS.keys())
-    #print(f'{ports}')
     idx = ports.index(SERVER_PORT)
     left = ports[idx - 1] if idx > 0 else ports[-1]
     right = ports[(idx + 1) % len(ports)]
@@ -249,16 +242,22 @@ def send_hs_reply(candidate_id, direction, origin):
     send_to_server(target, json.dumps(msg))
 
 def hs_election():
-    print('WE ARE CALLING HS ELECTION ATM')
     global HS_INIT_COUNT
     if HS_INIT_COUNT >= MAX_HS_INIT or len(KNOWN_SERVERS) == 0:
-        return
+        return    
     HS_INIT_COUNT += 1
     HS_STATE["candidate_id"] = SERVER_ID
     HS_STATE["current_phase"] = 0
     HS_STATE["replies_received"] = {"LEFT": False, "RIGHT": False}
     HS_STATE["phase_in_progress"] = True
-    HS_STATE["max_phase"] = ceil(log2(len(KNOWN_SERVERS)))
+    HS_STATE["max_phase"] = ceil(log2(len(KNOWN_SERVERS) / 2)) if len(KNOWN_SERVERS) > 1 else 0
+
+    # Singleton node case
+    if len(KNOWN_SERVERS) == 1:
+        global LEADER
+        LEADER = SERVER_ID
+        print(f"[{SERVER_PORT}] Only node alive, self elected as leader: {LEADER}")
+        return
 
     ring_sorted = sorted(KNOWN_SERVERS.values())
     print(f"[{SERVER_PORT}] Starting HS election as candidate {SERVER_ID}")
@@ -338,7 +337,8 @@ def leader_monitor():
                     KNOWN_SERVERS.pop(leader_port, None)
                     LAST_HEARTBEAT.pop(leader_port, None)
                 # Broadcast updated server list before HS
-                send_full_state()
+                #send_full_state()
+                broadcast_state()
                 hs_election()
         time.sleep(HEARTBEAT_INTERVAL)
 
@@ -360,7 +360,8 @@ def leader_check_servers():
                 PEER_IPS.pop(port, None)
                         # After removing dead servers, broadcast full state
             if dead:
-                send_full_state()
+                #send_full_state()
+                broadcast_state()
         time.sleep(HEARTBEAT_INTERVAL)
 
 # ------------------------------
@@ -493,7 +494,7 @@ def server_listener():
         except:
             continue
         # Update Lamport clock with the received timestamp
-            send_ack_to_leader()
+        #send_ack_to_leader()
 
         if "action" in msg and "ts" in msg and SERVER_ID is not LEADER:
             print("Local LAMPORT Time:", LAMPORT.read(), "Received TS:", msg["ts"])
@@ -536,14 +537,16 @@ def server_listener():
             if candidate != SERVER_ID:
                 send_hs_reply(candidate, direction, origin)
             else:
-                print(f'SHOW ME THIS LOGGED {direction}')
-                print(f'SHOW ME THIS LOGGED {HS_STATE}')
                 HS_STATE["replies_received"][direction] = True
                 if all(HS_STATE["replies_received"].values()):
                     if HS_STATE["current_phase"] >= HS_STATE["max_phase"]:
                         LEADER = SERVER_ID
                         HS_STATE["phase_in_progress"] = False
                         print(f"[{SERVER_PORT}] Leader elected via HS: {LEADER}")
+                        announce = { 
+                            "type": "FULL_STATE", "leader": LEADER, "servers": KNOWN_SERVERS, "state": STATE, "sessions": SESSIONS, "users": USERS } 
+                        for port in KNOWN_SERVERS:  
+                            send_to_server(port, json.dumps(announce))
                     else:
                         # Increment phase
                         HS_STATE["current_phase"] += 1
@@ -660,7 +663,7 @@ def print_status():
             end_time = datetime.fromtimestamp(item.get("end_time", now)).strftime('%Y-%m-%d %H:%M:%S')
             print(f" - {item['name']} | Current Bid: {item['current_bid']} | Last Bidder: {item['last_bidder']} | "
                   f"Starts: {start_time} | Ends: {end_time}")
-        print(f"Connected Clients: {list(CONNECTED_CLIENTS)}")
+        print(f"Connected Clients: {SESSIONS}")
         print("--------------------\n")
         time.sleep(STATUS_INTERVAL)
 
