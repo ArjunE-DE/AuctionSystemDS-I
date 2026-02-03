@@ -115,7 +115,7 @@ def send_ack_to_leader():
 
     # Construct and send the acknowledgement message
     ack_msg = {
-        "type": "SESSION_ACK",
+        "type": "ACK",
         "server_port": SERVER_PORT,
         "server_id": SERVER_ID,
         "ts": LAMPORT.read()  # Attach Lamport timestamp
@@ -140,6 +140,7 @@ def send_full_state(to_port):
 
 def broadcast_state(action={}):
     if 'add' in action or 'bid' in action:
+        print(f"Entered block at [{SERVER_PORT}] Broadcasting state update: {action}")
         LAMPORT.tick()
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
@@ -414,16 +415,16 @@ def server_listener():
             msg = json.loads(data.decode())
         except:
             continue
-        print(f"[{SERVER_PORT}] Received message from {addr}: {msg}")
         # Update Lamport clock with the received timestamp
-        if "ts" in msg and SERVER_ID is not LEADER:
-            print("Local LAMPORT Time:", LAMPORT.read(), "Received TS:", msg["ts"])
-            if(LAMPORT.read() < msg["ts"]):
-                LAMPORT.update(msg["ts"])
             send_ack_to_leader()
 
-        if "action" in msg:
+        if "action" in msg and "ts" in msg and SERVER_ID is not LEADER:
+            print("Local LAMPORT Time:", LAMPORT.read(), "Received TS:", msg["ts"])
             print(f"[{SERVER_PORT}] Received message: {msg['action']} from {addr} at timestamp {LAMPORT.read()}")
+            if LAMPORT.read() == msg["ts"] - 1:
+                LAMPORT.tick()
+            elif LAMPORT.read() < msg["ts"]:
+                LAMPORT.update(msg["ts"])
         mtype = msg.get("type")
 
         if mtype == "CLIENT":
@@ -489,11 +490,21 @@ def server_listener():
             if LEADER == SERVER_ID:
                 merge_sessions(msg.get("sessions", {}))
 
-        elif mtype == "SESSION_ACK":
+        elif mtype == "ACK":
             if LEADER == SERVER_ID and time.time() < ACK_TRACKER.get(msg.get("server_port"), 0):
                 print(f"[{SERVER_PORT}] Received ACK from server at port {msg.get('server_port')}")
+                ACK_TRACKER.pop(msg.get("server_port"), None)
             else:
                 print(f"[{SERVER_PORT}] Received late ACK from server at port {msg.get('server_port')}")
+                send_to_server(msg.get('server_port'), json.dumps({
+                    "type": "FULL_STATE",
+                    "leader": LEADER,
+                    "servers": KNOWN_SERVERS,
+                    "state": STATE,
+                    "sessions": SESSIONS,
+                    "users": USERS,
+                    "ts": LAMPORT.read()
+                }))
             pass
 
 # ------------------------------
@@ -536,6 +547,17 @@ if __name__ == "__main__":
             time.sleep(2)
             if LEADER is None:
                 hs_election()
-
+    for port in ACK_TRACKER:
+        if time.time() > ACK_TRACKER[port]:
+            print(f"[{SERVER_PORT}] No ACK from server at port {port}, sending full state.")
+            send_to_server(port, json.dumps({
+                "type": "FULL_STATE",
+                "leader": LEADER,
+                "servers": KNOWN_SERVERS,
+                "state": STATE,
+                "sessions": SESSIONS,
+                "users": USERS,
+                "ts": LAMPORT.read()
+            }))
     while True:
         time.sleep(1)
