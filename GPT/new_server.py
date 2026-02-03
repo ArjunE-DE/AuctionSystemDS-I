@@ -20,6 +20,7 @@ KNOWN_SERVERS = {}      # port -> server_id
 LAST_HEARTBEAT = {}     # port -> timestamp
 CONNECTED_CLIENTS = set()
 SESSIONS = {}           # session_id -> username
+ACK_TRACKER = {}      # port -> expected ACK time
 
 # NEW: map port -> ip (servers and clients)
 PEER_IPS = {}           # port -> ip string
@@ -81,9 +82,7 @@ LAMPORT = LamportClock()
 # Utilities
 # ------------------------------
 def send_to_multicast(msg):
-    msg = json.loads(msg)  # Ensure the message is a dictionary
-    msg["ts"] = LAMPORT.tick()  # Increment Lamport clock and attach timestamp
-    mcast_sock.sendto(json.dumps(msg).encode(), (MCAST_GRP, MCAST_PORT))
+    mcast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
 
 def send_to_server(port, msg):
     """
@@ -91,7 +90,38 @@ def send_to_server(port, msg):
     Falls back to 127.0.0.1 if we don't know the IP (e.g. same-machine).
     """
     ip = PEER_IPS.get(port, "127.0.0.1")
-    server_sock.sendto(msg.encode(), (ip, port))
+    msg = json.loads(msg)  # Ensure the message is a dictionary
+    #msg["ts"] = LAMPORT.tick()  # Increment Lamport clock and attach timestamp
+    server_sock.sendto(json.dumps(msg).encode(), (ip, port))
+
+def send_ack_to_leader():
+    """Send an acknowledgement message to the leader server."""
+    if LEADER == SERVER_ID:
+        return  # No need to ack if we are the leader
+    if LEADER is None:
+        print(f"[{SERVER_PORT}] No leader to acknowledge.")
+        return
+
+    # Find the leader's port
+    leader_port = None
+    for port, sid in KNOWN_SERVERS.items():
+        if sid == LEADER:
+            leader_port = port
+            break
+
+    if leader_port is None:
+        print(f"[{SERVER_PORT}] Leader not found in known servers.")
+        return
+
+    # Construct and send the acknowledgement message
+    ack_msg = {
+        "type": "SESSION_ACK",
+        "server_port": SERVER_PORT,
+        "server_id": SERVER_ID,
+        "ts": LAMPORT.read()  # Attach Lamport timestamp
+    }
+    send_to_server(leader_port, json.dumps(ack_msg))
+    print(f"[{SERVER_PORT}] Sent ACK to leader {LEADER} at port {leader_port}.")
 
 def send_hello():
     msg = {"type": "HELLO", "server_port": SERVER_PORT, "server_id": SERVER_ID}
@@ -108,19 +138,20 @@ def send_full_state(to_port):
     }
     send_to_server(to_port, json.dumps(msg))
 
-def broadcast_state(action = {}):
+def broadcast_state(action={}):
+    if 'add' in action or 'bid' in action:
+        LAMPORT.tick()
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
-            msg = {
+            ACK_TRACKER[port] = time.time() + 5  # Expect ACK within 5 seconds
+            send_to_server(port, json.dumps({
                 "type": "STATE_UPDATE",
                 "state": STATE,
                 "sessions": SESSIONS,
                 "users": USERS,
                 "action": action,
-                "ts": LAMPORT.tick()  # Attach Lamport timestamp
-            }
-
-            send_to_multicast(json.dumps(msg))
+                "ts": LAMPORT.read()
+            }))
 
 def normalize_sessions(sessions_dict):
     normalized = {}
@@ -182,13 +213,7 @@ def multicast_listener():
             msg = json.loads(data.decode())
         except:
             continue
-
-        # Update Lamport clock with the received timestamp
-        if "ts" in msg:
-            LAMPORT.update(msg["ts"])
-
-        if msg.get("type") != "HELLO" and "action" in msg:
-            print(f"Lamport clock updated to {LAMPORT.read()} after receiving messsage {msg["action"]}")
+        if msg.get("type") != "HELLO":
             continue
 
         port = int(msg["server_port"])
@@ -351,7 +376,7 @@ def process_command(command):
             "last_bidder": None
         }
         STATE["items"].append(new_item)
-        broadcast_state({"New item added": new_item})
+        broadcast_state({"add": new_item})
         return {"status":"added","item_id":item_id}
 
     # BID
@@ -366,7 +391,7 @@ def process_command(command):
                 if command["bid"] > min_bid:
                     item["current_bid"] = command["bid"]
                     item["last_bidder"] = username
-                    broadcast_state({"New bid on item": item["id"], "bid amount": command["bid"], "bidder": username})
+                    broadcast_state({"bid": item["id"], "bid amount": command["bid"], "bidder": username})
                     return {"status":"bid accepted"}
                 else:
                     return {
@@ -389,11 +414,16 @@ def server_listener():
             msg = json.loads(data.decode())
         except:
             continue
-
+        print(f"[{SERVER_PORT}] Received message from {addr}: {msg}")
         # Update Lamport clock with the received timestamp
-        if "ts" in msg:
-            LAMPORT.update(msg["ts"])
+        if "ts" in msg and SERVER_ID is not LEADER:
+            print("Local LAMPORT Time:", LAMPORT.read(), "Received TS:", msg["ts"])
+            if(LAMPORT.read() < msg["ts"]):
+                LAMPORT.update(msg["ts"])
+            send_ack_to_leader()
 
+        if "action" in msg:
+            print(f"[{SERVER_PORT}] Received message: {msg['action']} from {addr} at timestamp {LAMPORT.read()}")
         mtype = msg.get("type")
 
         if mtype == "CLIENT":
@@ -460,6 +490,10 @@ def server_listener():
                 merge_sessions(msg.get("sessions", {}))
 
         elif mtype == "SESSION_ACK":
+            if LEADER == SERVER_ID and time.time() < ACK_TRACKER.get(msg.get("server_port"), 0):
+                print(f"[{SERVER_PORT}] Received ACK from server at port {msg.get('server_port')}")
+            else:
+                print(f"[{SERVER_PORT}] Received late ACK from server at port {msg.get('server_port')}")
             pass
 
 # ------------------------------
