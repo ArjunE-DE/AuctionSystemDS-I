@@ -19,7 +19,11 @@ LEADER = None
 KNOWN_SERVERS = {}  # port -> server_id
 LAST_HEARTBEAT = {}  # port -> timestamp
 CONNECTED_CLIENTS = set()
-AUTHENTICATED_CLIENTS = {}  # client_port -> username
+SESSIONS = {}           # session_id -> username
+ACK_TRACKER = {}      # port -> expected ACK time
+
+# NEW: map port -> ip (servers and clients)
+PEER_IPS = {}           # port -> ip string
 
 # Hard-coded credentials
 USERS = {
@@ -55,6 +59,33 @@ mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
 print(f"[{SERVER_PORT}] Server started with ID {SERVER_ID}")
 
+# -----------------------------
+# Lamport Clock
+# -----------------------------
+class LamportClock:
+    def __init__(self, start: int = 0):
+        self.time = int(start)
+        self._lock = threading.Lock()
+
+    def tick(self) -> int:
+        """Increment the clock for an outgoing event."""
+        with self._lock:
+            self.time += 1
+            return self.time
+
+    def update(self, received_ts: int) -> int:
+        """Update the clock based on a received timestamp."""
+        with self._lock:
+            self.time = max(self.time, int(received_ts)) + 1
+            return self.time
+
+    def read(self) -> int:
+        """Read the current clock value."""
+        with self._lock:
+            return int(self.time)
+
+# Initialize the Lamport clock
+LAMPORT = LamportClock()
 # ------------------------------
 # Utilities
 # ------------------------------
@@ -62,7 +93,43 @@ def send_to_multicast(msg):
     mcast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
 
 def send_to_server(port, msg):
-    server_sock.sendto(msg.encode(), ("127.0.0.1", port))
+    """
+    Send to a peer (server or client) by port, using the last known IP.
+    Falls back to 127.0.0.1 if we don't know the IP (e.g. same-machine).
+    """
+    ip = PEER_IPS.get(port, "127.0.0.1")
+    msg = json.loads(msg)  # Ensure the message is a dictionary
+    #msg["ts"] = LAMPORT.tick()  # Increment Lamport clock and attach timestamp
+    server_sock.sendto(json.dumps(msg).encode(), (ip, port))
+
+def send_ack_to_leader():
+    """Send an acknowledgement message to the leader server."""
+    if LEADER == SERVER_ID:
+        return  # No need to ack if we are the leader
+    if LEADER is None:
+        print(f"[{SERVER_PORT}] No leader to acknowledge.")
+        return
+
+    # Find the leader's port
+    leader_port = None
+    for port, sid in KNOWN_SERVERS.items():
+        if sid == LEADER:
+            leader_port = port
+            break
+
+    if leader_port is None:
+        print(f"[{SERVER_PORT}] Leader not found in known servers.")
+        return
+
+    # Construct and send the acknowledgement message
+    ack_msg = {
+        "type": "ACK",
+        "server_port": SERVER_PORT,
+        "server_id": SERVER_ID,
+        "ts": LAMPORT.read()  # Attach Lamport timestamp
+    }
+    send_to_server(leader_port, json.dumps(ack_msg))
+    print(f"[{SERVER_PORT}] Sent ACK to leader {LEADER} at port {leader_port}.")
 
 def send_hello():
     msg = {"type": "HELLO", "server_port": SERVER_PORT, "server_id": SERVER_ID}
@@ -82,10 +149,32 @@ def send_full_state(to_port=None):
     else:
         send_to_server(to_port, json.dumps(msg))
 
-def broadcast_state():
+def broadcast_state(action={}):
+    if 'add' in action or 'bid' in action:
+        print(f"Entered block at [{SERVER_PORT}] Broadcasting state update: {action}")
+        LAMPORT.tick()
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
-            send_to_server(port, json.dumps({"type":"STATE_UPDATE","state":STATE}))
+            ACK_TRACKER[port] = time.time() + 5  # Expect ACK within 5 seconds
+            send_to_server(port, json.dumps({
+                "type": "STATE_UPDATE",
+                "state": STATE,
+                "sessions": SESSIONS,
+                "users": USERS,
+                "action": action,
+                "ts": LAMPORT.read()
+            }))
+          send_to_server(port, json.dumps({"type":"STATE_UPDATE","state":STATE}))
+def normalize_sessions(sessions_dict):
+    normalized = {}
+    for k, v in sessions_dict.items():
+        try:
+            sid = int(k)
+        except:
+            sid = k
+        normalized[sid] = v
+    return normalized
+            
 
 # ------------------------------
 # Hirschberg-Sinclair state
@@ -153,10 +242,10 @@ def hs_election():
 # Multicast listener
 # ------------------------------
 def multicast_listener():
-    global KNOWN_SERVERS, LAST_HEARTBEAT
+    global KNOWN_SERVERS, LAST_HEARTBEAT, PEER_IPS
     while True:
         try:
-            data, _ = mcast_sock.recvfrom(1024)
+            data, addr = mcast_sock.recvfrom(1024)
             msg = json.loads(data.decode())
         except:
             continue
@@ -166,12 +255,15 @@ def multicast_listener():
 
         port = int(msg["server_port"])
         sid = msg["server_id"]
+        ip = addr[0]
+
         if port == SERVER_PORT:
             continue
 
         is_new = port not in KNOWN_SERVERS
         KNOWN_SERVERS[port] = sid
         LAST_HEARTBEAT[port] = time.time()
+        PEER_IPS[port] = ip
 
         if is_new:
             print(f"[{SERVER_PORT}] Discovered server {sid} on port {port}")
@@ -192,6 +284,7 @@ def periodic_hello():
 def full_state_broadcast():
     while True:
         if LEADER == SERVER_ID:
+            broadcast_state({"Full state update from leader": SERVER_ID})
             for port in KNOWN_SERVERS:
                 if port != SERVER_PORT:
                     send_full_state(port)
@@ -238,6 +331,7 @@ def leader_check_servers():
                 print(f"[{SERVER_PORT}] Removing dead server {port}")
                 KNOWN_SERVERS.pop(port)
                 LAST_HEARTBEAT.pop(port, None)
+                PEER_IPS.pop(port, None)
             # After removing dead servers, broadcast full state
             if dead_ports:
                 send_full_state()
@@ -258,6 +352,16 @@ def auction_timer():
 # ------------------------------
 # Server listener
 # ------------------------------
+def process_command(command):
+    global STATE, SESSIONS, USERS
+
+    # REGISTER
+    if command["action"] == "register":
+        username = command.get("username")
+        password = command.get("password")
+
+        if username in USERS:
+            return {"status": "error", "message": "User already exists"}
 def server_listener():
     global STATE, KNOWN_SERVERS, LEADER, LAST_HEARTBEAT
     while True:
@@ -356,6 +460,8 @@ def server_listener():
                 LAST_HEARTBEAT[port] = now
             LAST_HEARTBEAT[SERVER_PORT] = now
 
+        broadcast_state({"New user created": username})
+        send_session_update()
         elif msg.get("type") == "PING":
             if SERVER_ID == LEADER:
                 send_to_server(addr[1], json.dumps({"type":"PONG"}))
@@ -365,6 +471,7 @@ def server_listener():
                 if port == addr[1]:
                     LAST_HEARTBEAT[port] = time.time()
 
+    # LOGIN
 # ------------------------------
 # Command processor
 # ------------------------------
@@ -378,16 +485,37 @@ def process_command(command, client_port):
         else:
             return {"status":"error","message":"Invalid credentials"}
 
-    if client_port not in AUTHENTICATED_CLIENTS:
-        return {"status":"error","message":"Not authenticated"}
+        if username not in USERS:
+            return {
+                "status": "new_user",
+                "message": f"User '{username}' does not exist. Create new account?"
+            }
+
+        if USERS[username] != password:
+            return {"status": "error", "message": "Invalid password"}
+
+        session_id = random.randint(10000, 99999)
+        SESSIONS[session_id] = username
+
+        broadcast_state({"User login": username})
+        send_session_update()
+
+        return {"status": "success", "message": f"Logged in as {username}", "session_id": session_id}
+
+    # SESSION VALIDATION
+    session_id = command.get("session_id")
+    if session_id not in SESSIONS:
+        return {"status": "error", "message": "Not authenticated"}
 
     username = AUTHENTICATED_CLIENTS[client_port]
     now = time.time()
 
+    # LIST
     if command["action"] == "list":
         return [item for item in STATE["items"] if item["end_time"] > now]
 
-    elif command["action"] == "add":
+    # ADD
+    if command["action"] == "add":
         item_id = len(STATE["items"]) + 1
         duration = command.get("duration", 60)
         start_time = now
@@ -403,9 +531,11 @@ def process_command(command, client_port):
             "last_bidder": None
         }
         STATE["items"].append(new_item)
+        broadcast_state({"add": new_item})
         return {"status":"added","item_id":item_id}
 
-    elif command["action"] == "bid":
+    # BID
+    if command["action"] == "bid":
         for item in STATE["items"]:
             if item["id"] == command["item_id"]:
                 if item["end_time"] <= now:
@@ -413,6 +543,7 @@ def process_command(command, client_port):
                 if command["bid"] > item["current_bid"]:
                     item["current_bid"] = command["bid"]
                     item["last_bidder"] = username
+                    broadcast_state({"bid": item["id"], "bid amount": command["bid"], "bidder": username})
                     return {"status":"bid accepted"}
                 else:
                     return {"status":"bid too low"}
@@ -421,7 +552,110 @@ def process_command(command, client_port):
     return {"status":"unknown command"}
 
 # ------------------------------
-# Status printer
+# Server Listener
+# ------------------------------
+def server_listener():
+    global STATE, KNOWN_SERVERS, LEADER, LAST_HEARTBEAT, SESSIONS, USERS, PEER_IPS
+    while True:
+        data, addr = server_sock.recvfrom(4096)
+        try:
+            msg = json.loads(data.decode())
+        except:
+            continue
+        # Update Lamport clock with the received timestamp
+            send_ack_to_leader()
+
+        if "action" in msg and "ts" in msg and SERVER_ID is not LEADER:
+            print("Local LAMPORT Time:", LAMPORT.read(), "Received TS:", msg["ts"])
+            print(f"[{SERVER_PORT}] Received message: {msg['action']} from {addr} at timestamp {LAMPORT.read()}")
+            if LAMPORT.read() == msg["ts"] - 1:
+                LAMPORT.tick()
+            elif LAMPORT.read() < msg["ts"]:
+                LAMPORT.update(msg["ts"])
+        mtype = msg.get("type")
+
+        if mtype == "CLIENT":
+            client_port = msg.get("client_port")
+            # remember client IP
+            if client_port is not None:
+                PEER_IPS[client_port] = addr[0]
+
+            command = msg.get("command")
+
+            if SERVER_ID == LEADER:
+                response = process_command(command)
+                send_to_server(client_port, json.dumps({"type":"RESPONSE","data":response}))
+            else:
+                leader_port = None
+                for port, sid in KNOWN_SERVERS.items():
+                    if sid == LEADER:
+                        leader_port = port
+                        break
+
+                if leader_port:
+                    send_to_server(client_port, json.dumps({
+                        "type": "REDIRECT",
+                        "leader_port": leader_port
+                    }))
+                else:
+                    send_to_server(client_port, json.dumps({
+                        "type": "RESPONSE",
+                        "data": {"status": "error", "message": "No leader available"}
+                    }))
+
+        elif mtype == "STATE_UPDATE":
+            STATE.update(msg.get("state", {}))
+            SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
+            USERS.update(msg.get("users", {}))
+
+        elif mtype == "FULL_STATE":
+            LEADER = msg.get("leader")
+            KNOWN_SERVERS.update({int(p): s for p,s in msg.get("servers", {}).items()})
+            STATE.update(msg.get("state", {}))
+            SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
+            USERS.update(msg.get("users", {}))
+            now = time.time()
+            for port in KNOWN_SERVERS:
+                LAST_HEARTBEAT[port] = now
+            LAST_HEARTBEAT[SERVER_PORT] = now
+
+        elif mtype == "SESSION_UPDATE":
+            SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
+            ack = {"type": "SESSION_ACK", "server_port": SERVER_PORT}
+            server_sock.sendto(json.dumps(ack).encode(), addr)
+
+        elif mtype == "SESSION_REQUEST":
+            if LEADER != SERVER_ID:
+                dump = {
+                    "type": "SESSION_DUMP",
+                    "sessions": SESSIONS,
+                    "server_port": SERVER_PORT
+                }
+                server_sock.sendto(json.dumps(dump).encode(), addr)
+
+        elif mtype == "SESSION_DUMP":
+            if LEADER == SERVER_ID:
+                merge_sessions(msg.get("sessions", {}))
+
+        elif mtype == "ACK":
+            if LEADER == SERVER_ID and time.time() < ACK_TRACKER.get(msg.get("server_port"), 0):
+                print(f"[{SERVER_PORT}] Received ACK from server at port {msg.get('server_port')}")
+                ACK_TRACKER.pop(msg.get("server_port"), None)
+            else:
+                print(f"[{SERVER_PORT}] Received late ACK from server at port {msg.get('server_port')}")
+                send_to_server(msg.get('server_port'), json.dumps({
+                    "type": "FULL_STATE",
+                    "leader": LEADER,
+                    "servers": KNOWN_SERVERS,
+                    "state": STATE,
+                    "sessions": SESSIONS,
+                    "users": USERS,
+                    "ts": LAMPORT.read()
+                }))
+            pass
+
+# ------------------------------
+# Status Printer
 # ------------------------------
 def print_status():
     while True:
@@ -447,6 +681,8 @@ def print_status():
 if __name__ == "__main__":
     KNOWN_SERVERS[SERVER_PORT] = SERVER_ID
     LAST_HEARTBEAT[SERVER_PORT] = time.time()
+    # local server IP for self (not strictly needed, but consistent)
+    PEER_IPS[SERVER_PORT] = "127.0.0.1"
 
     threading.Thread(target=multicast_listener, daemon=True).start()
     threading.Thread(target=server_listener, daemon=True).start()
@@ -467,6 +703,17 @@ if __name__ == "__main__":
             time.sleep(2)
             if LEADER is None:
                 hs_election()
-
+    for port in ACK_TRACKER:
+        if time.time() > ACK_TRACKER[port]:
+            print(f"[{SERVER_PORT}] No ACK from server at port {port}, sending full state.")
+            send_to_server(port, json.dumps({
+                "type": "FULL_STATE",
+                "leader": LEADER,
+                "servers": KNOWN_SERVERS,
+                "state": STATE,
+                "sessions": SESSIONS,
+                "users": USERS,
+                "ts": LAMPORT.read()
+            }))
     while True:
         time.sleep(1)

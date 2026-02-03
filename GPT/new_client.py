@@ -16,6 +16,29 @@ CLIENT_PORT = random.randint(6000, 7000)
 KNOWN_SERVERS = set()
 SERVER_LIST = []
 RR_INDEX = 0
+
+# NEW: map server port -> server IP
+SERVER_IPS = {}        # port -> ip string
+
+SESSION_ID = None
+LEADER_PORT = None
+
+MESSAGE_QUEUE = Queue()
+INPUT_QUEUE = Queue()
+
+# ------------------------------
+# States
+# ------------------------------
+STATE_LOGIN_USERNAME = 1
+STATE_LOGIN_PASSWORD = 2
+STATE_NEW_USER_PROMPT = 3
+STATE_NEW_USER_USERNAME = 4
+STATE_NEW_USER_PASSWORD = 5
+STATE_NORMAL = 6
+
+state = STATE_LOGIN_USERNAME
+pending_new_user_message = None
+temp_username = None
 AUTHENTICATED = False
 LAST_LIST = []
 
@@ -39,7 +62,7 @@ def multicast_listener():
     global SERVER_LIST
     while True:
         try:
-            data, _ = mcast_sock.recvfrom(1024)
+            data, addr = mcast_sock.recvfrom(1024)
             msg = json.loads(data.decode())
         except:
             continue
@@ -48,7 +71,41 @@ def multicast_listener():
             continue
 
         port = int(msg["server_port"])
+        ip = addr[0]
+
         KNOWN_SERVERS.add(port)
+        SERVER_LAST_SEEN[port] = time.time()
+        SERVER_IPS[port] = ip
+        SERVER_LIST = sorted(KNOWN_SERVERS)
+
+threading.Thread(target=multicast_listener, daemon=True).start()
+
+# ------------------------------
+# Prune dead servers (client-side)
+# ------------------------------
+def prune_dead_servers():
+    global SERVER_LIST, LEADER_PORT
+    TIMEOUT = 8
+    while True:
+        now = time.time()
+        removed = False
+        for port in list(SERVER_LIST):
+            last = SERVER_LAST_SEEN.get(port, 0)
+            if now - last > TIMEOUT:
+                print(f"[CLIENT] Pruning dead server {port} from list.")
+                SERVER_LIST.remove(port)
+                KNOWN_SERVERS.discard(port)
+                SERVER_LAST_SEEN.pop(port, None)
+                SERVER_IPS.pop(port, None)
+                if LEADER_PORT == port:
+                    LEADER_PORT = None
+                removed = True
+        if removed and not SERVER_LIST:
+            print("[CLIENT] No known servers after pruning.")
+        time.sleep(2)
+
+threading.Thread(target=prune_dead_servers, daemon=True).start()
+
         SERVER_LIST = sorted(KNOWN_SERVERS)
 
 # ------------------------------
@@ -64,7 +121,10 @@ def listen_responses():
         except Exception:
             continue
 
+        ip = SERVER_IPS.get(port, "127.0.0.1")
+
         try:
+            sock.sendto(json.dumps(msg).encode(), (ip, port))
             msg = json.loads(data.decode())
         except:
             continue
