@@ -143,6 +143,12 @@ def send_full_state(to_port):
         "sessions": SESSIONS,
         "users": USERS
     }
+    if to_port is None:
+        for port in KNOWN_SERVERS:
+            if port != SERVER_PORT:
+                send_to_server(port, json.dumps(msg))
+    else:
+        send_to_server(to_port, json.dumps(msg))
     send_to_server(to_port, json.dumps(msg))
 
 def broadcast_state(action={}):
