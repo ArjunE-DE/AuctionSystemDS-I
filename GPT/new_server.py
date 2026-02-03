@@ -50,11 +50,40 @@ mcast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
 print(f"[{SERVER_PORT}] Server started with ID {SERVER_ID}")
 
+# -----------------------------
+# Lamport Clock
+# -----------------------------
+class LamportClock:
+    def __init__(self, start: int = 0):
+        self.time = int(start)
+        self._lock = threading.Lock()
+
+    def tick(self) -> int:
+        """Increment the clock for an outgoing event."""
+        with self._lock:
+            self.time += 1
+            return self.time
+
+    def update(self, received_ts: int) -> int:
+        """Update the clock based on a received timestamp."""
+        with self._lock:
+            self.time = max(self.time, int(received_ts)) + 1
+            return self.time
+
+    def read(self) -> int:
+        """Read the current clock value."""
+        with self._lock:
+            return int(self.time)
+
+# Initialize the Lamport clock
+LAMPORT = LamportClock()
 # ------------------------------
 # Utilities
 # ------------------------------
 def send_to_multicast(msg):
-    mcast_sock.sendto(msg.encode(), (MCAST_GRP, MCAST_PORT))
+    msg = json.loads(msg)  # Ensure the message is a dictionary
+    msg["ts"] = LAMPORT.tick()  # Increment Lamport clock and attach timestamp
+    mcast_sock.sendto(json.dumps(msg).encode(), (MCAST_GRP, MCAST_PORT))
 
 def send_to_server(port, msg):
     """
@@ -79,15 +108,19 @@ def send_full_state(to_port):
     }
     send_to_server(to_port, json.dumps(msg))
 
-def broadcast_state():
+def broadcast_state(action = {}):
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
-            send_to_server(port, json.dumps({
+            msg = {
                 "type": "STATE_UPDATE",
                 "state": STATE,
                 "sessions": SESSIONS,
-                "users": USERS
-            }))
+                "users": USERS,
+                "action": action,
+                "ts": LAMPORT.tick()  # Attach Lamport timestamp
+            }
+
+            send_to_multicast(json.dumps(msg))
 
 def normalize_sessions(sessions_dict):
     normalized = {}
@@ -149,7 +182,13 @@ def multicast_listener():
             msg = json.loads(data.decode())
         except:
             continue
-        if msg.get("type") != "HELLO":
+
+        # Update Lamport clock with the received timestamp
+        if "ts" in msg:
+            LAMPORT.update(msg["ts"])
+
+        if msg.get("type") != "HELLO" and "action" in msg:
+            print(f"Lamport clock updated to {LAMPORT.read()} after receiving messsage {msg["action"]}")
             continue
 
         port = int(msg["server_port"])
@@ -181,7 +220,7 @@ def periodic_hello():
 def full_state_broadcast():
     while True:
         if LEADER == SERVER_ID:
-            broadcast_state()
+            broadcast_state({"Full state update from leader": SERVER_ID})
         time.sleep(FULL_STATE_INTERVAL)
 
 # ------------------------------
@@ -252,7 +291,7 @@ def process_command(command):
         session_id = random.randint(10000, 99999)
         SESSIONS[session_id] = username
 
-        broadcast_state()
+        broadcast_state({"New user created": username})
         send_session_update()
 
         return {
@@ -278,7 +317,7 @@ def process_command(command):
         session_id = random.randint(10000, 99999)
         SESSIONS[session_id] = username
 
-        broadcast_state()
+        broadcast_state({"User login": username})
         send_session_update()
 
         return {"status": "success", "message": f"Logged in as {username}", "session_id": session_id}
@@ -312,7 +351,7 @@ def process_command(command):
             "last_bidder": None
         }
         STATE["items"].append(new_item)
-        broadcast_state()
+        broadcast_state({"New item added": new_item})
         return {"status":"added","item_id":item_id}
 
     # BID
@@ -327,7 +366,7 @@ def process_command(command):
                 if command["bid"] > min_bid:
                     item["current_bid"] = command["bid"]
                     item["last_bidder"] = username
-                    broadcast_state()
+                    broadcast_state({"New bid on item": item["id"], "bid amount": command["bid"], "bidder": username})
                     return {"status":"bid accepted"}
                 else:
                     return {
@@ -350,6 +389,10 @@ def server_listener():
             msg = json.loads(data.decode())
         except:
             continue
+
+        # Update Lamport clock with the received timestamp
+        if "ts" in msg:
+            LAMPORT.update(msg["ts"])
 
         mtype = msg.get("type")
 
