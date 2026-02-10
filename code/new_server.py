@@ -389,13 +389,6 @@ def auction_monitor():
                         }))
                 STATE["items"].remove(item)
         time.sleep(5)  # Check every 5 seconds
-
-                # msg = {
-                #     "type": "RESPONSE", 
-                #     "server_port": SERVER_PORT, 
-                #     "server_id": SERVER_ID
-                #     }
-                # send_to_multicast(json.dumps(msg))
 # ------------------------------
 # Auction Timer
 # ------------------------------
