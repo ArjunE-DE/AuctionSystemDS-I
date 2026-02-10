@@ -620,44 +620,42 @@ def server_listener():
         # ---------------- Replication / state messages ----------------
         elif mtype == "STATE_UPDATE":
             received_timestamp = msg.get("ts");
-            if received_timestamp < LAMPORT.read():
-                break
-            STATE.update(msg.get("state", {}))
-            SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
-            USERS.update(msg.get("users", {}))
-            leader_port = None
-            for port, sid in KNOWN_SERVERS.items():
-                if sid == LEADER:
-                    leader_port = port
-                    break
-            send_to_server(leader_port, {"type": "LAMPORT_ACK", "server_port": SERVER_PORT, "server_id": SERVER_ID})
+            if received_timestamp >= LAMPORT.read():
+                STATE.update(msg.get("state", {}))
+                SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
+                USERS.update(msg.get("users", {}))
+                leader_port = None
+                for port, sid in KNOWN_SERVERS.items():
+                    if sid == LEADER:
+                        leader_port = port
+                        break
+                send_to_server(leader_port, {"type": "LAMPORT_ACK", "server_port": SERVER_PORT, "server_id": SERVER_ID})
 
         elif mtype == "FULL_STATE":
             received_timestamp = msg.get("ts");
-            if received_timestamp < LAMPORT.read():
-                break
-            old_leader = LEADER
-            LEADER = msg.get("leader")
-            if LEADER != old_leader:
-                print(f"[{SERVER_PORT}] Adopting leader info from node: {LEADER}")
-            leader_servers = {int(port): sid for port, sid in msg.get("servers", {}).items()}
-            for port in list(KNOWN_SERVERS.keys()):
-                if port not in leader_servers:
-                    print(f"[{SERVER_PORT}] Removing unknown server {port} per leader update")
-                    KNOWN_SERVERS.pop(port, None)
-                    LAST_HEARTBEAT.pop(port, None)
-            KNOWN_SERVERS.update(leader_servers)
-            STATE = msg.get("state", STATE)
-            now = time.time()
-            for port in KNOWN_SERVERS:
-                LAST_HEARTBEAT[port] = now
-            LAST_HEARTBEAT[SERVER_PORT] = now
-            leader_port = None
-            for port, sid in KNOWN_SERVERS.items():
-                if sid == LEADER:
-                    leader_port = port
-                    break
-            send_to_server(leader_port, {"type": "LAMPORT_ACK", "server_port": SERVER_PORT, "server_id": SERVER_ID})
+            if received_timestamp >= LAMPORT.read():
+                old_leader = LEADER
+                LEADER = msg.get("leader")
+                if LEADER != old_leader:
+                    print(f"[{SERVER_PORT}] Adopting leader info from node: {LEADER}")
+                leader_servers = {int(port): sid for port, sid in msg.get("servers", {}).items()}
+                for port in list(KNOWN_SERVERS.keys()):
+                    if port not in leader_servers:
+                        print(f"[{SERVER_PORT}] Removing unknown server {port} per leader update")
+                        KNOWN_SERVERS.pop(port, None)
+                        LAST_HEARTBEAT.pop(port, None)
+                KNOWN_SERVERS.update(leader_servers)
+                STATE = msg.get("state", STATE)
+                now = time.time()
+                for port in KNOWN_SERVERS:
+                    LAST_HEARTBEAT[port] = now
+                LAST_HEARTBEAT[SERVER_PORT] = now
+                leader_port = None
+                for port, sid in KNOWN_SERVERS.items():
+                    if sid == LEADER:
+                        leader_port = port
+                        break
+                send_to_server(leader_port, {"type": "LAMPORT_ACK", "server_port": SERVER_PORT, "server_id": SERVER_ID})
 
         elif mtype == "SESSION_UPDATE":
             SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
