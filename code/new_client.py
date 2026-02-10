@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import socket
 import struct
 import json
@@ -43,10 +44,14 @@ def multicast_listener():
             msg = json.loads(data.decode())
         except:
             continue
-
+        if msg.get("type") == "AUCTION_RESULT":
+            if msg.get("winner_session_id") == SESSION_ID:
+                print(f"\n\n[AUCTION WON] {msg.get('message')}")
+            else:
+                print(f"\n\n[AUCTION RESULT] {msg.get('message')}")         
         if msg.get("type") != "HELLO":
             continue
-
+        
         port = msg["server_port"]
         KNOWN_SERVERS.add(port)
         SERVER_LAST_SEEN[port] = time.time()
@@ -72,6 +77,50 @@ def prune():
         time.sleep(2)
 
 threading.Thread(target=prune, daemon=True).start()
+
+# ---------------- INPUT HELPERS ----------------
+
+def read_int(prompt, allow_empty=False):
+    while True:
+        try:
+            s = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print("\nInput cancelled.")
+            return None
+        if allow_empty and s.strip() == "":
+            return None
+        try:
+            return int(s.strip())
+        except ValueError:
+            print("Please enter a valid integer.")
+
+def read_float(prompt, allow_empty=False):
+    while True:
+        try:
+            s = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print("\nInput cancelled.")
+            return None
+        if allow_empty and s.strip() == "":
+            return None
+        try:
+            return float(s.strip())
+        except ValueError:
+            print("Please enter a valid number.")
+
+def read_nonempty(prompt, allow_empty=False):
+    while True:
+        try:
+            s = input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print("\nInput cancelled.")
+            return None
+        if allow_empty and s.strip() == "":
+            return ""
+        if s.strip() == "":
+            print("Input cannot be empty.")
+            continue
+        return s.strip()
 
 # ---------------- NETWORK HELPERS ----------------
 
@@ -125,8 +174,12 @@ def send_command(cmd):
 def login():
     global SESSION_ID
 
-    u = input("Username: ")
-    p = input("Password: ")
+    u = read_nonempty("Username: ")
+    if u is None:
+        return
+    p = read_nonempty("Password: ")
+    if p is None:
+        return
 
     resp = send_command({
         "action": "login",
@@ -134,18 +187,26 @@ def login():
         "password": p
     })
 
-    if resp and resp["type"] == "RESPONSE":
-        data = resp["data"]
+    if resp and resp.get("type") == "RESPONSE":
+        data = resp.get("data", {})
         if data.get("status") == "success":
             SESSION_ID = data["session_id"]
             print("Logged in.")
+        else:
+            print(data.get("message", data))
+    else:
+        print("Login failed or no response.")
 
 
 def register():
     global SESSION_ID
 
-    u = input("Choose username: ")
-    p = input("Choose password: ")
+    u = read_nonempty("Choose username: ")
+    if u is None:
+        return
+    p = read_nonempty("Choose password: ")
+    if p is None:
+        return
 
     resp = send_command({
         "action": "register",
@@ -153,11 +214,15 @@ def register():
         "password": p
     })
 
-    if resp and resp["type"] == "RESPONSE":
-        data = resp["data"]
+    if resp and resp.get("type") == "RESPONSE":
+        data = resp.get("data", {})
         if data.get("status") == "success":
             SESSION_ID = data["session_id"]
             print("Registered.")
+        else:
+            print(data.get("message", data))
+    else:
+        print("Register failed or no response.")
 
 
 def list_auctions():
@@ -166,15 +231,30 @@ def list_auctions():
         "session_id": SESSION_ID
     })
 
-    if resp and resp["type"] == "RESPONSE":
-        print(resp["data"])
+    if resp and resp.get("type") == "RESPONSE":
+        print(resp.get("data"))
+    else:
+        print("Failed to list auctions or no response.")
 
 
 def add():
-    name = input("Name: ")
+    if SESSION_ID is None:
+        print("You must be logged in to add an item.")
+        return
+
+    name = read_nonempty("Name: ")
+    if name is None:
+        print("Add cancelled.")
+        return
     desc = input("Description: ")
-    dur = int(input("Duration: "))
-    price = float(input("Start price: "))
+    dur = read_int("Duration (seconds): ")
+    if dur is None:
+        print("Add cancelled.")
+        return
+    price = read_float("Start price: ")
+    if price is None:
+        print("Add cancelled.")
+        return
 
     resp = send_command({
         "action": "add",
@@ -187,11 +267,23 @@ def add():
 
     if resp:
         print(resp)
+    else:
+        print("Add failed or no response.")
 
 
 def bid():
-    i = int(input("Item id: "))
-    a = float(input("Amount: "))
+    if SESSION_ID is None:
+        print("You must be logged in to place a bid.")
+        return
+
+    i = read_int("Item id: ")
+    if i is None:
+        print("Bid cancelled.")
+        return
+    a = read_float("Amount: ")
+    if a is None:
+        print("Bid cancelled.")
+        return
 
     resp = send_command({
         "action": "bid",
@@ -202,6 +294,8 @@ def bid():
 
     if resp:
         print(resp)
+    else:
+        print("Bid failed or no response.")
 
 
 # ---------------- MAIN ----------------
@@ -213,23 +307,25 @@ while not KNOWN_SERVERS:
 print("[CLIENT] Servers:", KNOWN_SERVERS)
 
 while True:
-
-    cmd = input("\nlogin | register | list | add | bid | quit > ")
-
-    if cmd == "login":
-        login()
-
-    elif cmd == "register":
-        register()
-
-    elif cmd == "list":
-        list_auctions()
-
-    elif cmd == "add":
-        add()
-
-    elif cmd == "bid":
-        bid()
-
-    elif cmd == "quit":
-        sys.exit(0)
+    if SESSION_ID is None:
+        cmd = input("\nlogin | register | quit > ").strip().lower()
+        if cmd == "login":
+            login()
+        elif cmd == "register":
+            register()
+        elif cmd == "quit":
+            sys.exit(0)
+        else:
+            print("Available commands: login, register, quit")
+    else:
+        cmd = input("\nlist | add | bid | quit > ").strip().lower()
+        if cmd == "list":
+            list_auctions()
+        elif cmd == "add":
+            add()
+        elif cmd == "bid":
+            bid()
+        elif cmd == "quit":
+            sys.exit(0)
+        else:
+            print("Available commands: list, add, bid, quit")
