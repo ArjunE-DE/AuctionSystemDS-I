@@ -283,6 +283,14 @@ while True:
             if isinstance(resp, dict) and resp.get("status") == "bid too low":
                 print(f"\n[BID REJECTED] {resp.get('message')}\n")
                 continue
+            
+            # # Auction won
+            if isinstance(resp, dict) and resp.get("status") == "auction won":
+                if resp.get("winner_session_id") == SESSION_ID:
+                    print(f"\n[AUCTION WON] {resp.get('message')}\n")
+                else:
+                    print(f"\n[AUCTION ENDED] {resp.get('message')}\n")
+                continue
 
             # Generic error
             if isinstance(resp, dict) and resp.get("status") == "error":

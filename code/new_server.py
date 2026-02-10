@@ -365,6 +365,38 @@ def leader_check_servers():
         time.sleep(HEARTBEAT_INTERVAL)
 
 # ------------------------------
+# Auction Monitor
+# ------------------------------
+def auction_monitor():
+    while True:
+        current_time = time.time()
+        for item in STATE["items"]:
+            end_time = item.get('end_time')
+            if end_time and current_time > end_time:
+                last_bidder = item.get('last_bidder')
+                item_name = item.get('name')
+                winner_session_id = list(SESSIONS.keys())[list(SESSIONS.values()).index(last_bidder)] if last_bidder in SESSIONS.values() else None
+                print(f"Auction for {item_name} has ended. Last bidder: {last_bidder}, session id: {winner_session_id}")
+                for i in range(6000, 7000):
+                    if PEER_IPS.get(i):
+                        send_to_server(i, json.dumps({
+                            "type": "RESPONSE",
+                            "data": {
+                                "winner_session_id": winner_session_id,
+                                "status": "auction won",
+                                "message": f"{last_bidder} has won the auction for item: {item_name}, with a bid of {item.get('current_bid')}"
+                            }
+                        }))
+                STATE["items"].remove(item)
+        time.sleep(5)  # Check every 5 seconds
+
+                # msg = {
+                #     "type": "RESPONSE", 
+                #     "server_port": SERVER_PORT, 
+                #     "server_id": SERVER_ID
+                #     }
+                # send_to_multicast(json.dumps(msg))
+# ------------------------------
 # Auction Timer
 # ------------------------------
 def auction_timer():
@@ -451,7 +483,7 @@ def process_command(command):
             "start_time": start_time,
             "end_time": start_time + duration,
             "start_price": command.get("start_price",0),
-            "current_bid": 0,
+            "current_bid": command.get("start_price",0),
             "last_bidder": None
         }
         STATE["items"].append(new_item)
@@ -684,6 +716,7 @@ if __name__ == "__main__":
     threading.Thread(target=leader_check_servers, daemon=True).start()
     threading.Thread(target=full_state_broadcast, daemon=True).start()
     threading.Thread(target=auction_timer, daemon=True).start()
+    # threading.Thread(target=auction_monitor, daemon=True).start()
 
     time.sleep(5)
     if LEADER is None:
