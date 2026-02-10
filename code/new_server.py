@@ -354,7 +354,7 @@ def leader_check_servers():
                 if port not in LAST_HEARTBEAT or now - LAST_HEARTBEAT[port] > HEARTBEAT_TIMEOUT:
                     dead.append(port)
             for port in dead:
-                print(f"[{SERVER_PORT}] Removing dead server {port}")
+                print(f"[{SERVER_PORT}] Removing dead server {KNOWN_SERVERS[port]}")
                 KNOWN_SERVERS.pop(port, None)
                 LAST_HEARTBEAT.pop(port, None)
                 PEER_IPS.pop(port, None)
@@ -716,7 +716,7 @@ if __name__ == "__main__":
     threading.Thread(target=leader_check_servers, daemon=True).start()
     threading.Thread(target=full_state_broadcast, daemon=True).start()
     threading.Thread(target=auction_timer, daemon=True).start()
-    # threading.Thread(target=auction_monitor, daemon=True).start()
+    threading.Thread(target=auction_monitor, daemon=True).start()
 
     time.sleep(5)
     if LEADER is None:
