@@ -493,7 +493,10 @@ def process_command(command):
 def server_listener():
     global STATE, KNOWN_SERVERS, LEADER, LAST_HEARTBEAT, SESSIONS, USERS, PEER_IPS
     while True:
-        data, addr = server_sock.recvfrom(4096)
+        try:
+            data, addr = server_sock.recvfrom(4096)
+        except ConnectionResetError:
+            continue
         try:
             msg = json.loads(data.decode())
         except:
