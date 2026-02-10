@@ -81,7 +81,7 @@ class LamportClock:
     def read(self) -> int:
         """Read the current clock value."""
         with self._lock:
-            return int(self.time)
+            return int(self.time if self.time else 0)
 
 # Initialize the Lamport clock
 LAMPORT = LamportClock()
@@ -681,7 +681,7 @@ def server_listener():
                     "ts": LAMPORT.read()
                 }))
         elif mtype == "LAMPORT_ACK":
-            print(f"Received LAMPORT_ACK from Server ID: {msg.get("server_ID",'')} at port {msg.get("server_port",'')}")
+            print(f"Received LAMPORT_ACK from Server ID: {msg.get("server_id",'')} at port {msg.get("server_port",'')}")
             pass        
 
 # ------------------------------
