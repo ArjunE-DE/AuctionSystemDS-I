@@ -19,15 +19,14 @@ SERVER_LIST = []
 SERVER_LAST_SEEN = {}  # port -> timestamp
 RR_INDEX = 0
 
-# server port -> server IP
-SERVER_IPS = {}
+# NEW: map server port -> server IP
+SERVER_IPS = {}        # port -> ip string
 
 SESSION_ID = None
+LEADER_PORT = None
 
 MESSAGE_QUEUE = Queue()
 INPUT_QUEUE = Queue()
-
-REQUEST_COUNTER = 0
 
 # ------------------------------
 # States
@@ -82,10 +81,10 @@ def multicast_listener():
 threading.Thread(target=multicast_listener, daemon=True).start()
 
 # ------------------------------
-# Prune dead servers
+# Prune dead servers (client-side)
 # ------------------------------
 def prune_dead_servers():
-    global SERVER_LIST
+    global SERVER_LIST, LEADER_PORT
     TIMEOUT = 8
     while True:
         now = time.time()
@@ -98,6 +97,8 @@ def prune_dead_servers():
                 KNOWN_SERVERS.discard(port)
                 SERVER_LAST_SEEN.pop(port, None)
                 SERVER_IPS.pop(port, None)
+                if LEADER_PORT == port:
+                    LEADER_PORT = None
                 removed = True
         if removed and not SERVER_LIST:
             print("[CLIENT] No known servers after pruning.")
@@ -141,27 +142,20 @@ def choose_server():
     return server
 
 # ------------------------------
-# Request ID generator
-# ------------------------------
-def next_request_id():
-    global REQUEST_COUNTER
-    REQUEST_COUNTER += 1
-    return f"{CLIENT_PORT}-{REQUEST_COUNTER}"
-
-# ------------------------------
-# Safe send to any server
+# Safe send with leader failover
 # ------------------------------
 def send_to_server_safe(command):
-    global SESSION_ID
+    global LEADER_PORT, SESSION_ID, SERVER_LIST
 
     cmd = dict(command)
     if SESSION_ID:
         cmd["session_id"] = SESSION_ID
 
-    request_id = next_request_id()
-
     tried = set()
     ports_to_try = []
+
+    if LEADER_PORT:
+        ports_to_try.append(LEADER_PORT)
 
     fallback = choose_server()
     if fallback is not None:
@@ -172,12 +166,7 @@ def send_to_server_safe(command):
             continue
         tried.add(port)
 
-        msg = {
-            "type": "CLIENT",
-            "client_port": CLIENT_PORT,
-            "request_id": request_id,
-            "command": cmd
-        }
+        msg = {"type": "CLIENT", "client_port": CLIENT_PORT, "command": cmd}
 
         ip = SERVER_IPS.get(port, "127.0.0.1")
 
@@ -187,15 +176,24 @@ def send_to_server_safe(command):
             if port in SERVER_LIST:
                 print(f"[CLIENT] Failed to send to server {port}. Removing from list.")
                 SERVER_LIST.remove(port)
+            if port == LEADER_PORT:
+                LEADER_PORT = None
             continue
 
         time.sleep(0.2)
         if not MESSAGE_QUEUE.empty():
             return True
 
-        if port in SERVER_LIST:
-            print(f"[CLIENT] Server {port} unresponsive. Removing from server list.")
-            SERVER_LIST.remove(port)
+        # No response from this port
+        if port == LEADER_PORT:
+            print(f"[CLIENT] Leader {LEADER_PORT} unresponsive. Removing from server list.")
+            if port in SERVER_LIST:
+                SERVER_LIST.remove(port)
+            LEADER_PORT = None
+        else:
+            if port in SERVER_LIST:
+                print(f"[CLIENT] Server {port} unresponsive. Removing from server list.")
+                SERVER_LIST.remove(port)
 
     print("[CLIENT] No servers responded.")
     return False
@@ -253,13 +251,19 @@ while True:
     while not MESSAGE_QUEUE.empty():
         msg = MESSAGE_QUEUE.get()
 
+        if msg["type"] == "REDIRECT":
+            LEADER_PORT = msg["leader_port"]
+            continue
+
         if msg["type"] == "RESPONSE":
             resp = msg["data"]
 
+            # Auction list
             if isinstance(resp, list):
                 display_auction_list(resp)
                 continue
 
+            # New user required
             if isinstance(resp, dict) and resp.get("status") == "new_user":
                 pending_new_user_message = resp["message"]
                 state = STATE_NEW_USER_PROMPT
@@ -267,6 +271,7 @@ while True:
                     INPUT_QUEUE.get()
                 continue
 
+            # Login or registration success
             if isinstance(resp, dict) and resp.get("status") == "success":
                 if "Logged in" in resp.get("message", "") or "created" in resp.get("message", ""):
                     SESSION_ID = resp["session_id"]
@@ -274,18 +279,12 @@ while True:
                     state = STATE_NORMAL
                     continue
 
+            # Bid too low
             if isinstance(resp, dict) and resp.get("status") == "bid too low":
                 print(f"\n[BID REJECTED] {resp.get('message')}\n")
                 continue
-            
-            # # Auction won
-            if isinstance(resp, dict) and resp.get("status") == "auction won":
-                if resp.get("winner_session_id") == SESSION_ID:
-                    print(f"\n[AUCTION WON] {resp.get('message')}\n")
-                else:
-                    print(f"\n[AUCTION ENDED] {resp.get('message')}\n")
-                continue
 
+            # Generic error
             if isinstance(resp, dict) and resp.get("status") == "error":
                 print("\n[SERVER RESPONSE]")
                 print(json.dumps(resp, indent=2))
@@ -299,6 +298,7 @@ while True:
     while not INPUT_QUEUE.empty():
         cmd = INPUT_QUEUE.get().strip()
 
+        # --- Login flow ---
         if state == STATE_LOGIN_USERNAME:
             temp_username = cmd
             print("Password:")
@@ -313,6 +313,7 @@ while True:
             })
             continue
 
+        # --- New user prompt ---
         elif state == STATE_NEW_USER_PROMPT:
             if pending_new_user_message is not None:
                 print(pending_new_user_message)
@@ -346,6 +347,7 @@ while True:
             })
             continue
 
+        # --- Normal auction commands ---
         elif state == STATE_NORMAL:
             if not cmd:
                 continue
@@ -358,12 +360,14 @@ while True:
             args = parts[1:]
             command = None
 
+            # LIST
             if action == "list":
                 if args:
                     print("Usage: list\n")
                     continue
                 command = {"action": "list"}
 
+            # ADD
             elif action == "add":
                 if len(args) < 4:
                     print("Usage: add <name> <description> <duration> <start_price>\n")
@@ -387,6 +391,7 @@ while True:
                     "start_price": start_price
                 }
 
+            # BID
             elif action == "bid":
                 if len(args) != 2:
                     print("Usage: bid <item_id> <amount>\n")
@@ -405,10 +410,12 @@ while True:
                     "bid": amount
                 }
 
+            # QUIT
             elif action == "quit":
                 print("Goodbye.")
                 exit(0)
 
+            # UNKNOWN
             else:
                 print("Unknown command. Available commands:")
                 print("  list")
