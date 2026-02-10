@@ -20,7 +20,6 @@ LEADER = None
 KNOWN_SERVERS = {}      # port -> server_id
 LAST_HEARTBEAT = {}     # port -> timestamp
 SESSIONS = {}           # session_id -> username
-ACK_TRACKER = {}        # port -> expected ACK time
 
 # NEW: map port -> ip (servers and clients)
 PEER_IPS = {}           # port -> ip string
@@ -108,7 +107,8 @@ def send_full_state(to_port=None):
         "servers": KNOWN_SERVERS,
         "state": STATE,
         "sessions": SESSIONS,
-        "users": USERS
+        "users": USERS,
+        "ts": LAMPORT.read()
     }
     send_to_server(to_port, msg)
 
@@ -117,7 +117,6 @@ def broadcast_state(action={}):
         LAMPORT.tick()
     for port in KNOWN_SERVERS:
         if port != SERVER_PORT:
-            ACK_TRACKER[port] = time.time() + 5
             send_to_server(port, {
                 "type": "STATE_UPDATE",
                 "state": STATE,
@@ -479,7 +478,6 @@ def server_listener():
             continue
 
         mtype = msg.get("type")
-
         # ---------------- HS messages ----------------
         if mtype == "HS_ELECTION":
             candidate = msg["candidate_id"]
@@ -523,7 +521,8 @@ def server_listener():
                             "servers": KNOWN_SERVERS,
                             "state": STATE,
                             "sessions": SESSIONS,
-                            "users": USERS
+                            "users": USERS,
+                            "ts": LAMPORT.read()
                         }
                             # send to all servers (including self is harmless)
                         for port in KNOWN_SERVERS:
@@ -620,11 +619,23 @@ def server_listener():
 
         # ---------------- Replication / state messages ----------------
         elif mtype == "STATE_UPDATE":
+            received_timestamp = msg.get("ts");
+            if received_timestamp < LAMPORT.read():
+                break
             STATE.update(msg.get("state", {}))
             SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
             USERS.update(msg.get("users", {}))
+            leader_port = None
+            for port, sid in KNOWN_SERVERS.items():
+                if sid == LEADER:
+                    leader_port = port
+                    break
+            send_to_server(leader_port, {"type": "LAMPORT_ACK", "server_port": SERVER_PORT, "server_id": SERVER_ID})
 
         elif mtype == "FULL_STATE":
+            received_timestamp = msg.get("ts");
+            if received_timestamp < LAMPORT.read():
+                break
             old_leader = LEADER
             LEADER = msg.get("leader")
             if LEADER != old_leader:
@@ -641,6 +652,12 @@ def server_listener():
             for port in KNOWN_SERVERS:
                 LAST_HEARTBEAT[port] = now
             LAST_HEARTBEAT[SERVER_PORT] = now
+            leader_port = None
+            for port, sid in KNOWN_SERVERS.items():
+                if sid == LEADER:
+                    leader_port = port
+                    break
+            send_to_server(leader_port, {"type": "LAMPORT_ACK", "server_port": SERVER_PORT, "server_id": SERVER_ID})
 
         elif mtype == "SESSION_UPDATE":
             SESSIONS.update(normalize_sessions(msg.get("sessions", {})))
@@ -659,22 +676,8 @@ def server_listener():
         elif mtype == "SESSION_DUMP":
             if LEADER == SERVER_ID:
                 merge_sessions(msg.get("sessions", {}))
-
-        elif mtype == "ACK":
-            if LEADER == SERVER_ID and time.time() < ACK_TRACKER.get(msg.get("server_port"), 0):
-                print(f"[{SERVER_PORT}] Received ACK from server at port {msg.get('server_port')}")
-                ACK_TRACKER.pop(msg.get("server_port"), None)
-            else:
-                print(f"[{SERVER_PORT}] Received late ACK from server at port {msg.get('server_port')}")
-                send_to_server(msg.get('server_port'), {
-                    "type": "FULL_STATE",
-                    "leader": LEADER,
-                    "servers": KNOWN_SERVERS,
-                    "state": STATE,
-                    "sessions": SESSIONS,
-                    "users": USERS,
-                    "ts": LAMPORT.read()
-                })
+        elif mtype == "LAMPORT_ACK":
+            print(f"[{SERVER_PORT}] Received LAMPORT_ACK from server at port {msg.get('server_port')} at time {LAMPORT.read()}")
 
 # ------------------------------
 # Status Printer
