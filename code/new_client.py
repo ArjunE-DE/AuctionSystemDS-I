@@ -46,6 +46,11 @@ def multicast_listener():
         except:
             continue
 
+        if msg.get("type") == "AUCTION_RESULT":
+            if msg.get("winner_session_id") == SESSION_ID:
+                print(f"\n\n[AUCTION WON] {msg.get('message')}")
+            else:
+                print(f"\n\n[AUCTION RESULT] {msg.get('message')}")  
         if msg.get("type") != "HELLO":
             continue
 
