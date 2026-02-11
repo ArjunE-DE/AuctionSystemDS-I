@@ -6,6 +6,7 @@ import random
 import threading
 import time
 import sys
+from datetime import datetime
 
 # ---------------- CONFIG ----------------
 
@@ -44,14 +45,10 @@ def multicast_listener():
             msg = json.loads(data.decode())
         except:
             continue
-        if msg.get("type") == "AUCTION_RESULT":
-            if msg.get("winner_session_id") == SESSION_ID:
-                print(f"\n\n[AUCTION WON] {msg.get('message')}")
-            else:
-                print(f"\n\n[AUCTION RESULT] {msg.get('message')}")         
+
         if msg.get("type") != "HELLO":
             continue
-        
+
         port = msg["server_port"]
         KNOWN_SERVERS.add(port)
         SERVER_LAST_SEEN[port] = time.time()
@@ -226,15 +223,58 @@ def register():
 
 
 def list_auctions():
+    """
+    Request the list of auctions from the server and print them with human-readable start/end times.
+    """
     resp = send_command({
         "action": "list",
         "session_id": SESSION_ID
     })
 
-    if resp and resp.get("type") == "RESPONSE":
-        print(resp.get("data"))
-    else:
+    if not resp:
         print("Failed to list auctions or no response.")
+        return
+
+    if resp.get("type") != "RESPONSE":
+        print("Unexpected response:", resp)
+        return
+
+    data = resp.get("data")
+    # If server returned an error message (dict with status), print it
+    if isinstance(data, dict) and data.get("status") == "error":
+        print(data.get("message", data))
+        return
+
+    # Expecting a list of items
+    if not isinstance(data, list):
+        print("Unexpected data format:", data)
+        return
+
+    if not data:
+        print("No active auctions.")
+        return
+
+    print("\n--- AUCTION ITEMS ---")
+    now_ts = time.time()
+    for item in data:
+        # Safely extract timestamps; fall back to None if missing
+        start_ts = item.get("start_time")
+        end_ts = item.get("end_time")
+
+        # Convert to readable strings if possible
+        try:
+            start_str = datetime.fromtimestamp(float(start_ts)).strftime("%Y-%m-%d %H:%M:%S") if start_ts is not None else "N/A"
+        except Exception:
+            start_str = "Invalid timestamp"
+
+        try:
+            end_str = datetime.fromtimestamp(float(end_ts)).strftime("%Y-%m-%d %H:%M:%S") if end_ts is not None else "N/A"
+        except Exception:
+            end_str = "Invalid timestamp"
+
+        print(f"ID: {item.get('id')} | Name: {item.get('name')} | Current Bid: {item.get('current_bid')} | "
+              f"Last Bidder: {item.get('last_bidder')} | Starts: {start_str} | Ends: {end_str}")
+    print("---------------------\n")
 
 
 def add():
