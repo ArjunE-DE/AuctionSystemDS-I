@@ -67,7 +67,6 @@ class LamportClock:
 
     def tick(self) -> int:
         """Increment the clock for an outgoing event."""
-        print("LAMPORT.tick() called")
         with self._lock:
             if self.time is None:
                 self.time = 0
