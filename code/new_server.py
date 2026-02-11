@@ -478,12 +478,13 @@ def process_command(command):
             "owner": username,
             "start_time": start_time,
             "end_time": start_time + duration,
-            "start_price": command.get("start_price",0),
-            "current_bid": 0,
+            "start_price": command.get("start_price", 0),
+            "current_bid": command.get("start_price", 0),
             "last_bidder": None
         }
         STATE["items"].append(new_item)
         broadcast_state(False, {"add": new_item})
+        print(f"New item added: {new_item['name']}, {new_item['description']} at starting price {new_item['start_price']} by user {username} with session {session_id}")
         return {"status":"added","item_id":item_id}
 
     # BID
@@ -499,6 +500,7 @@ def process_command(command):
                     item["current_bid"] = command["bid"]
                     item["last_bidder"] = username
                     broadcast_state(False, {"bid": item["id"], "bid amount": command["bid"], "bidder": username})
+                    print(f"New bid on item {item['name']} (ID: {item['id']}): {command['bid']} by user {username} with session {session_id}")
                     return {"status":"bid accepted"}
                 else:
                     return {
@@ -524,16 +526,6 @@ def server_listener():
             msg = json.loads(data.decode())
         except:
             continue
-        # Update Lamport clock with the received timestamp
-        #send_ack_to_leader()
-        print(f"printing from line 502 {msg}")
-        # if "action" in msg and "ts" in msg and SERVER_ID is not LEADER:
-        #     print("Local LAMPORT Time:", LAMPORT.read(), "Received TS:", msg["ts"])
-        #     print(f"[{SERVER_PORT}] Received message: {msg['action']} from {addr} at timestamp {LAMPORT.read()}")
-            # if LAMPORT.read() == msg["ts"] - 1:
-            #     LAMPORT.tick()
-            # elif LAMPORT.read() < msg["ts"]:
-            #     LAMPORT.update(msg["ts"])
         mtype = msg.get("type")
         # ---------------- HS messages ----------------
         if msg.get("type") == "HS_ELECTION":
